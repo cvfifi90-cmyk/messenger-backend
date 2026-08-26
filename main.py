@@ -342,6 +342,11 @@ async def secure_websocket(websocket: WebSocket, token: str):
         while True:
             raw = await websocket.receive_text()
             if is_user_banned(user_id):
+                await websocket.send_text(json.dumps({
+                    "type": "user_banned",
+                    "message": "🚨 Ваш аккаунт заблокирован навсегда за нарушение правил безопасности."
+                }))
+                await asyncio.sleep(0.05)
                 await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
                 manager.disconnect(user_id)
                 break
@@ -488,7 +493,7 @@ async def secure_websocket(websocket: WebSocket, token: str):
     except Exception:
         manager.disconnect(user_id)
 
-# ----------------- ПАНЕЛЬ АДМИНИСТРАТОРА С ФУНКЦИЕЙ БАНА -----------------
+# ----------------- ПАНЕЛЬ АДМИНИСТРАТОРА С ФУНКЦИЕЙ МГНОВЕННОГО БАНА -----------------
 @app.get("/admin", response_class=HTMLResponse)
 def admin_page(key: str = ""):
     if key != ADMIN_SECRET_KEY:
@@ -724,10 +729,18 @@ async def admin_ban_user(user_id: str, key: str):
     conn.commit()
     conn.close()
 
-    # Мгновенный сброс активного сокета
+    # Мгновенная отправка команды разлогина клиенту перед разрывом сокета
     if user_id in manager.active_sockets:
         ws = manager.active_sockets[user_id]
-        await ws.close(code=status.WS_1008_POLICY_VIOLATION)
+        try:
+            await ws.send_text(json.dumps({
+                "type": "user_banned",
+                "message": "🚨 Ваш аккаунт заблокирован навсегда за нарушение правил безопасности."
+            }))
+            await asyncio.sleep(0.05)
+            await ws.close(code=status.WS_1008_POLICY_VIOLATION)
+        except Exception:
+            pass
         manager.disconnect(user_id)
 
     return {"status": "ok", "detail": f"Пользователь {user_id} заблокирован навсегда"}
