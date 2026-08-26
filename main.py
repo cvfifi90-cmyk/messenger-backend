@@ -15,9 +15,10 @@ from pydantic import BaseModel
 SECRET_KEY = "AURA_SUPER_SECRET_MILITARY_KEY_CHANGE_THIS_IN_PROD_123!@#"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_DAYS = 30
+ADMIN_SECRET_KEY = "super_admin_secret_pass_123"
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-app = FastAPI(title="Aura Telegram Secure Core")
+app = FastAPI(title="Aura Telegram Secure Core & Admin Engine")
 
 app.add_middleware(
     CORSMiddleware,
@@ -143,6 +144,15 @@ class LoginRequest(BaseModel):
     password: str
 
 # ----------------- ЭНДПОИНТЫ АВТОРИЗАЦИИ -----------------
+@app.get("/")
+def home():
+    return {
+        "status": "online",
+        "service": "Aura Telegram Core",
+        "active_sockets": len(manager.active_sockets),
+        "db": "SQLite Persistent"
+    }
+
 @app.post("/api/register")
 def register(req: RegisterRequest):
     username_clean = req.username.strip().replace("@", "").lower()
@@ -165,7 +175,7 @@ def register(req: RegisterRequest):
         VALUES (?, ?, ?, ?, ?, ?, ?)
     """, (user_id, username_clean, hashed_pwd, req.name.strip(), req.phone.strip(), "В сети Aura 🛡", now_str))
 
-    # Создаем Избранное
+    # Создаем Избранное (Saved Messages)
     saved_id = f"saved_{user_id}"
     c.execute("INSERT INTO chats (id, type, name, created_by) VALUES (?, ?, ?, ?)", (saved_id, "saved", "Избранное", user_id))
     c.execute("INSERT INTO chat_members (chat_id, user_id) VALUES (?, ?)", (saved_id, user_id))
@@ -242,12 +252,17 @@ def get_chats(token: str):
         status_text = ""
 
         if ctype == "personal":
-            c.execute("SELECT u.name, u.username FROM users u JOIN chat_members cm ON u.id = cm.user_id WHERE cm.chat_id = ? AND u.id != ?", (cid, user_id))
+            c.execute("""
+                SELECT u.name, u.username, u.id 
+                FROM users u 
+                JOIN chat_members cm ON u.id = cm.user_id 
+                WHERE cm.chat_id = ? AND u.id != ?
+            """, (cid, user_id))
             partner = c.fetchone()
             if partner:
                 display_name = partner[0]
                 avatar_letter = partner[0][0]
-                is_online = partner[1] in manager.active_sockets
+                is_online = partner[2] in manager.active_sockets
                 status_text = "в сети" if is_online else "был(а) недавно"
         elif ctype == "saved":
             display_name = "Избранное"
@@ -282,7 +297,11 @@ def search_users(query: str, token: str):
     q = f"%{query.strip().replace('@', '').lower()}%"
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("SELECT id, username, name, phone, bio FROM users WHERE (username LIKE ? OR name LIKE ? OR phone LIKE ?) AND id != ?", (q, q, q, user_id))
+    c.execute("""
+        SELECT id, username, name, phone, bio 
+        FROM users 
+        WHERE (username LIKE ? OR name LIKE ? OR phone LIKE ?) AND id != ?
+    """, (q, q, q, user_id))
     rows = c.fetchall()
     conn.close()
 
@@ -314,7 +333,6 @@ async def secure_websocket(websocket: WebSocket, token: str):
                 time_str = datetime.now().strftime("%H:%M")
                 msg_id = f"msg_{uuid.uuid4().hex[:10]}"
 
-                # Серверная проверка: состоит ли отправитель в этом чате
                 conn = sqlite3.connect(DB_FILE)
                 c = conn.cursor()
                 c.execute("SELECT 1 FROM chat_members WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
@@ -322,12 +340,13 @@ async def secure_websocket(websocket: WebSocket, token: str):
                     conn.close()
                     continue
 
-                # Имя отправителя
                 c.execute("SELECT name FROM users WHERE id = ?", (user_id,))
                 sender_name = c.fetchone()[0]
 
-                c.execute("INSERT INTO messages (id, chat_id, sender_id, text, time, is_voice) VALUES (?, ?, ?, ?, ?, ?)",
-                          (msg_id, chat_id, user_id, text, time_str, is_voice))
+                c.execute("""
+                    INSERT INTO messages (id, chat_id, sender_id, text, time, is_voice) 
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (msg_id, chat_id, user_id, text, time_str, is_voice))
                 conn.commit()
                 conn.close()
 
@@ -358,6 +377,52 @@ async def secure_websocket(websocket: WebSocket, token: str):
                     "chat_id": chat_id,
                     "user_id": user_id,
                     "user_name": user_name
+                })
+
+            elif action == "add_reaction":
+                chat_id = data["chat_id"]
+                msg_id = data["msg_id"]
+                emoji = data["emoji"]
+
+                conn = sqlite3.connect(DB_FILE)
+                c = conn.cursor()
+                c.execute("SELECT reactions FROM messages WHERE id = ?", (msg_id,))
+                row = c.fetchone()
+                reactions_dict = {}
+                if row and row[0]:
+                    try:
+                        reactions_dict = json.loads(row[0])
+                    except Exception:
+                        reactions_dict = {}
+
+                reactions_dict[emoji] = reactions_dict.get(emoji, 0) + 1
+                c.execute("UPDATE messages SET reactions = ? WHERE id = ?", (json.dumps(reactions_dict), msg_id))
+                conn.commit()
+                conn.close()
+
+                await manager.broadcast_chat(chat_id, {
+                    "type": "reaction_updated",
+                    "chat_id": chat_id,
+                    "msg_id": msg_id,
+                    "reactions": reactions_dict
+                })
+
+            elif action == "pin_message":
+                chat_id = data["chat_id"]
+                msg_id = data["msg_id"]
+                pinned_text = data.get("text", "")
+
+                conn = sqlite3.connect(DB_FILE)
+                c = conn.cursor()
+                c.execute("UPDATE chats SET pinned_msg_id = ? WHERE id = ?", (msg_id, chat_id))
+                conn.commit()
+                conn.close()
+
+                await manager.broadcast_chat(chat_id, {
+                    "type": "message_pinned",
+                    "chat_id": chat_id,
+                    "msg_id": msg_id,
+                    "text": pinned_text
                 })
 
             elif action == "create_personal_chat":
@@ -395,3 +460,66 @@ async def secure_websocket(websocket: WebSocket, token: str):
         manager.disconnect(user_id)
     except Exception:
         manager.disconnect(user_id)
+
+# ----------------- ПАНЕЛЬ АДМИНИСТРАТОРА И УПРАВЛЕНИЯ -----------------
+@app.get("/admin/dashboard")
+def admin_dashboard(key: str):
+    if key != ADMIN_SECRET_KEY:
+        raise HTTPException(status_code=403, detail="Доступ запрещен: неверный ключ администратора")
+
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT id, username, name, phone, bio, created_at FROM users")
+    users = c.fetchall()
+
+    c.execute("SELECT id, type, name, created_by, pinned_msg_id FROM chats")
+    chats = c.fetchall()
+
+    c.execute("SELECT COUNT(*) FROM messages")
+    total_messages = c.fetchone()[0]
+
+    # Последние 20 сообщений со всего сервера
+    c.execute("SELECT id, chat_id, sender_id, text, time FROM messages ORDER BY rowid DESC LIMIT 20")
+    recent_messages = c.fetchall()
+    conn.close()
+
+    return {
+        "status": "operational",
+        "active_sockets_online": len(manager.active_sockets),
+        "online_user_ids": list(manager.active_sockets.keys()),
+        "total_registered_users": len(users),
+        "total_chats_created": len(chats),
+        "total_messages_sent": total_messages,
+        "users": [
+            {
+                "id": u[0],
+                "username": f"@{u[1]}",
+                "name": u[2],
+                "phone": u[3],
+                "bio": u[4],
+                "registered_at": u[5],
+                "is_online": u[0] in manager.active_sockets
+            }
+            for u in users
+        ],
+        "chats": [
+            {
+                "id": ch[0],
+                "type": ch[1],
+                "name": ch[2],
+                "creator_id": ch[3],
+                "pinned_msg_id": ch[4]
+            }
+            for ch in chats
+        ],
+        "recent_messages": [
+            {
+                "id": m[0],
+                "chat_id": m[1],
+                "sender_id": m[2],
+                "text": m[3],
+                "time": m[4]
+            }
+            for m in recent_messages
+        ]
+    }
