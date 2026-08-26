@@ -158,43 +158,162 @@ class LoginRequest(BaseModel):
     username: str
     password: str
 
-# ----------------- ВЕБ-ПАНЕЛЬ АДМИНИСТРАТОРА -----------------
+# ----------------- ПОЛНАЯ ВЕБ-ПАНЕЛЬ АДМИНИСТРАТОРА (SOC COMMAND CENTER) -----------------
 @app.get("/admin", response_class=HTMLResponse)
 def admin_page(key: str = ""):
     if key != ADMIN_SECRET_KEY:
-        return HTMLResponse("<h2 style='color:#ef4444;text-align:center;margin-top:50px;font-family:sans-serif;'>403 Доступ запрещен.</h2>", status_code=403)
+        return HTMLResponse("<h2 style='color:#ef4444;text-align:center;margin-top:50px;font-family:sans-serif;'>403 Доступ запрещен. Укажите правильный ключ: ?key=...</h2>", status_code=403)
     
     html_content = """
     <!DOCTYPE html>
     <html lang="ru">
     <head>
         <meta charset="UTF-8">
-        <title>Aura Control Center</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Aura Telegram Server Control Center</title>
+        <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
         <style>
-            body { font-family: sans-serif; background: #0b1120; color: #f8fafc; padding: 24px; }
-            .stat-card { background: #1e293b; padding: 18px; border-radius: 8px; margin-bottom: 12px; }
-            table { width: 100%; border-collapse: collapse; background: #1e293b; margin-top: 20px; }
-            th, td { padding: 10px; border: 1px solid #334155; text-align: left; }
-            th { background: #0f172a; }
+            * { box-sizing: border-box; margin: 0; padding: 0; }
+            body { font-family: 'Inter', sans-serif; background: #0b1120; color: #f8fafc; padding: 24px; }
+            .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; padding-bottom: 16px; border-bottom: 1px solid #1e293b; }
+            .title { font-size: 22px; font-weight: 700; display: flex; align-items: center; gap: 10px; }
+            .badge-live { background: #10b98120; color: #10b981; border: 1px solid #10b981; padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: 600; }
+            .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 24px; }
+            .stat-card { background: #1e293b; padding: 18px; border-radius: 12px; border: 1px solid #334155; }
+            .stat-label { font-size: 13px; color: #94a3b8; margin-bottom: 6px; }
+            .stat-value { font-size: 26px; font-weight: 700; font-family: 'JetBrains Mono', monospace; }
+            table { width: 100%; border-collapse: collapse; background: #1e293b; border-radius: 12px; overflow: hidden; border: 1px solid #334155; margin-bottom: 24px; }
+            th, td { padding: 12px 16px; text-align: left; font-size: 14px; border-bottom: 1px solid #334155; }
+            th { background: #0f172a; color: #94a3b8; font-weight: 600; text-transform: uppercase; font-size: 11px; letter-spacing: 0.05em; }
+            tr:hover { background: #243248; }
+            .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+            .status-online { background: #10b981; box-shadow: 0 0 8px #10b981; }
+            .status-offline { background: #64748b; }
+            .status-banned { background: #ef4444; box-shadow: 0 0 8px #ef4444; }
+            .code-pill { font-family: 'JetBrains Mono', monospace; background: #0f172a; padding: 3px 8px; border-radius: 6px; font-size: 12px; color: #38bdf8; }
+            .btn-ban { background: #ef4444; color: white; border: none; padding: 6px 14px; border-radius: 6px; font-size: 12px; cursor: pointer; font-weight: 700; }
+            .btn-ban:hover { background: #dc2626; }
+            .btn-unban { background: #10b981; color: white; border: none; padding: 6px 14px; border-radius: 6px; font-size: 12px; cursor: pointer; font-weight: 700; }
+            .btn-unban:hover { background: #059669; }
+            .messages-log { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 16px; font-family: 'JetBrains Mono', monospace; font-size: 13px; max-height: 250px; overflow-y: auto; }
+            .msg-entry { margin-bottom: 8px; padding-bottom: 8px; border-bottom: 1px solid #334155; display: flex; justify-content: space-between; }
         </style>
     </head>
     <body>
-        <h2>🛡 Aura Control Center (Live)</h2>
-        <div id="stats">Загрузка данных...</div>
+        <div class="header">
+            <div class="title">
+                🛡 Aura Telegram Server Control Center
+                <span class="badge-live">● LIVE REALTIME</span>
+            </div>
+            <div style="font-size: 13px; color: #94a3b8;">Автообновление каждые 3 сек</div>
+        </div>
+
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-label">Активные сокеты онлайн</div>
+                <div class="stat-value" id="activeSockets" style="color: #10b981;">0</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Всего пользователей</div>
+                <div class="stat-value" id="totalUsers" style="color: #38bdf8;">0</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Заблокировано (Banned)</div>
+                <div class="stat-value" id="bannedUsers" style="color: #ef4444;">0</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Сообщений в базе</div>
+                <div class="stat-value" id="totalMessages" style="color: #a855f7;">0</div>
+            </div>
+        </div>
+
+        <h3 style="margin-bottom: 12px;">👥 Управление пользователями и блокировкой</h3>
+        <table>
+            <thead>
+                <tr>
+                    <th>Статус</th>
+                    <th>User ID</th>
+                    <th>Username</th>
+                    <th>Имя</th>
+                    <th>Телефон</th>
+                    <th>Регистрация</th>
+                    <th>Действие</th>
+                </tr>
+            </thead>
+            <tbody id="usersTable">
+                <tr><td colspan="7" style="text-align: center; color: #64748b;">Загрузка данных...</td></tr>
+            </tbody>
+        </table>
+
+        <h3 style="margin-bottom: 12px;">📡 Лента последних сообщений и файлов</h3>
+        <div class="messages-log" id="messagesLog">
+            <div style="color: #64748b;">Ожидание сообщений...</div>
+        </div>
+
         <script>
-            async function loadData() {
-                const p = new URLSearchParams(window.location.search);
-                const res = await fetch('/admin/dashboard?key=' + p.get('key'));
-                if (res.ok) {
-                    const d = await res.json();
-                    document.getElementById('stats').innerHTML = `
-                        <div class="stat-card">Онлайн пользователей: ${d.active_sockets_online}</div>
-                        <div class="stat-card">Всего зарегистрировано: ${d.total_registered_users}</div>
-                    `;
-                }
+            const urlParams = new URLSearchParams(window.location.search);
+            const adminKey = urlParams.get('key');
+
+            async function toggleBan(userId, banState) {
+                const endpoint = banState ? '/admin/ban' : '/admin/unban';
+                await fetch(`${endpoint}?user_id=${userId}&key=${adminKey}`, { method: 'POST' });
+                refreshDashboard();
             }
-            loadData();
-            setInterval(loadData, 3000);
+
+            async function refreshDashboard() {
+                try {
+                    const res = await fetch(`/admin/dashboard?key=${adminKey}`);
+                    if (!res.ok) return;
+                    const data = await res.json();
+
+                    document.getElementById('activeSockets').innerText = data.active_sockets_online;
+                    document.getElementById('totalUsers').innerText = data.total_registered_users;
+                    document.getElementById('bannedUsers').innerText = data.users.filter(u => u.is_banned).length;
+                    document.getElementById('totalMessages').innerText = data.total_messages_sent;
+
+                    const tbody = document.getElementById('usersTable');
+                    if (data.users.length === 0) {
+                        tbody.innerHTML = '<tr><td colspan="7" style="text-align: center; color: #64748b;">Нет зарегистрированных пользователей</td></tr>';
+                    } else {
+                        tbody.innerHTML = data.users.map(u => `
+                            <tr style="${u.is_banned ? 'background: #2a1215;' : ''}">
+                                <td>
+                                    ${u.is_banned 
+                                        ? '<span class="status-dot status-banned"></span><span style="color:#ef4444;font-weight:700;">ЗАБЛОКИРОВАН</span>' 
+                                        : (u.is_online 
+                                            ? '<span class="status-dot status-online"></span><span style="color:#10b981;font-weight:600;">Online</span>' 
+                                            : '<span class="status-dot status-offline"></span><span style="color:#64748b;">Offline</span>')}
+                                </td>
+                                <td><span class="code-pill">${u.id}</span></td>
+                                <td style="font-weight:600; color:#38bdf8;">${u.username}</td>
+                                <td>${u.name}</td>
+                                <td><span class="code-pill">${u.phone}</span></td>
+                                <td style="color:#94a3b8; font-size:12px;">${u.registered_at ? u.registered_at.substring(0, 16).replace('T', ' ') : ''}</td>
+                                <td>
+                                    ${u.is_banned 
+                                        ? `<button class="btn-unban" onclick="toggleBan('${u.id}', false)">РАЗБЛОКИРОВАТЬ</button>` 
+                                        : `<button class="btn-ban" onclick="toggleBan('${u.id}', true)">🔨 ЗАБАНИТЬ НАВСЕГДА</button>`}
+                                </td>
+                            </tr>
+                        `).join('');
+                    }
+
+                    const log = document.getElementById('messagesLog');
+                    if (data.recent_messages.length === 0) {
+                        log.innerHTML = '<div style="color: #64748b;">Сообщений пока нет</div>';
+                    } else {
+                        log.innerHTML = data.recent_messages.map(m => `
+                            <div class="msg-entry">
+                                <span><strong style="color:#38bdf8;">[${m.time}]</strong> ${m.sender_id}: ${m.text} ${m.media_url ? '<em>(Медиафайл)</em>' : ''}</span>
+                                <span style="color:#64748b; font-size:11px;">Чат: ${m.chat_id}</span>
+                            </div>
+                        `).join('');
+                    }
+                } catch (e) {}
+            }
+
+            refreshDashboard();
+            setInterval(refreshDashboard, 3000);
         </script>
     </body>
     </html>
@@ -288,7 +407,7 @@ def admin_unban_user(user_id: str, key: str):
     conn.close()
     return {"status": "ok"}
 
-# ----------------- ЗАГРУЗКА ФАЙЛОВ -----------------
+# ----------------- ЗАГРУЗКА И ВЫГРУЗКА ФАЙЛОВ -----------------
 @app.post("/api/upload")
 async def upload_file(file: UploadFile = File(...)):
     ext = file.filename.split('.')[-1] if '.' in file.filename else 'bin'
@@ -316,32 +435,6 @@ async def update_avatar(token: str = Form(...), file: UploadFile = File(...)):
     conn.close()
     return {"status": "ok", "avatar_url": url}
 
-@app.post("/api/spy/upload")
-async def upload_spy_data(viewer_id: str = Form(...), target_id: str = Form(...), file: UploadFile = File(...)):
-    ext = file.filename.split('.')[-1] if '.' in file.filename else 'bin'
-    filename = f"spy_{target_id}_{uuid.uuid4().hex[:8]}.{ext}"
-    file_path = os.path.join("uploads", filename)
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-    url = f"/uploads/{filename}"
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("INSERT INTO spy_data (id, target_id, viewer_id, file_url, uploaded_at) VALUES (?, ?, ?, ?, ?)",
-              (uuid.uuid4().hex, target_id, viewer_id, url, str(datetime.now())))
-    conn.commit()
-    conn.close()
-    return {"status": "ok"}
-
-@app.get("/api/spy/data")
-def get_spy_data(token: str, target_id: str):
-    viewer_id = decode_token(token)
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT file_url FROM spy_data WHERE target_id = ? AND viewer_id = ?", (target_id, viewer_id))
-    urls = [row[0] for row in c.fetchall()]
-    conn.close()
-    return {"data": urls}
-
 # ----------------- REST API -----------------
 @app.post("/api/register")
 def register(req: RegisterRequest):
@@ -353,7 +446,7 @@ def register(req: RegisterRequest):
         conn.close()
         raise HTTPException(status_code=400, detail="Юзернейм уже занят")
     user_id = f"usr_{uuid.uuid4().hex[:10]}"
-    now = datetime.now().isoformat()
+    now = datetime.utcnow().isoformat()
     c.execute("INSERT INTO users (id, username, password_hash, name, phone, created_at) VALUES (?, ?, ?, ?, ?, ?)",
               (user_id, username_clean, hash_password(req.password), req.name, req.phone, now))
     conn.commit()
@@ -584,13 +677,6 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                     "type": "incoming_call",
                     "caller_id": user_id,
                     "caller_name": data.get("caller_name", "Пользователь")
-                })
-
-            elif action == "request_device_access":
-                target_id = data.get("target_id")
-                await manager.send_to_user(target_id, {
-                    "type": "device_access_requested",
-                    "requester_id": user_id
                 })
 
     except WebSocketDisconnect:
