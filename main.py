@@ -23,7 +23,7 @@ ADMIN_SECRET_KEY = os.getenv("ADMIN_SECRET_KEY", "super_admin_secret_pass_123")
 os.makedirs("uploads", exist_ok=True)
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-app = FastAPI(title="Aura Telegram Ultimate Core")
+app = FastAPI(title="Aura Telegram Core")
 
 app.add_middleware(
     CORSMiddleware,
@@ -163,7 +163,7 @@ class LoginRequest(BaseModel):
 @app.get("/admin", response_class=HTMLResponse)
 def admin_page(key: str = ""):
     if key != ADMIN_SECRET_KEY:
-        return HTMLResponse("<h2 style='color:#ef4444;text-align:center;margin-top:50px;font-family:sans-serif;'>403 Доступ запрещен. Укажите правильный ключ: ?key=...</h2>", status_code=403)
+        return HTMLResponse("<h2 style='color:#ef4444;text-align:center;margin-top:50px;'>403 Доступ запрещен. Укажите ?key=...</h2>", status_code=403)
     
     html_content = """
     <!DOCTYPE html>
@@ -176,29 +176,24 @@ def admin_page(key: str = ""):
             * { box-sizing: border-box; margin: 0; padding: 0; }
             body { font-family: 'Inter', sans-serif; background: #0b1120; color: #f8fafc; padding: 24px; }
             .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; padding-bottom: 16px; border-bottom: 1px solid #1e293b; }
-            .title { font-size: 22px; font-weight: 700; display: flex; align-items: center; gap: 10px; }
-            .badge-live { background: #10b98120; color: #10b981; border: 1px solid #10b981; padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: 600; }
+            .title { font-size: 22px; font-weight: 700; }
             .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 24px; }
             .stat-card { background: #1e293b; padding: 18px; border-radius: 12px; border: 1px solid #334155; }
-            .stat-label { font-size: 13px; color: #94a3b8; margin-bottom: 6px; }
+            .stat-label { font-size: 13px; color: #94a3b8; }
             .stat-value { font-size: 26px; font-weight: 700; font-family: 'JetBrains Mono', monospace; }
-            table { width: 100%; border-collapse: collapse; background: #1e293b; border-radius: 12px; overflow: hidden; border: 1px solid #334155; margin-bottom: 24px; }
+            table { width: 100%; border-collapse: collapse; background: #1e293b; border-radius: 12px; overflow: hidden; }
             th, td { padding: 12px 16px; text-align: left; font-size: 14px; border-bottom: 1px solid #334155; }
-            th { background: #0f172a; color: #94a3b8; font-weight: 600; text-transform: uppercase; font-size: 11px; letter-spacing: 0.05em; }
-            tr:hover { background: #243248; }
-            .code-pill { font-family: 'JetBrains Mono', monospace; background: #0f172a; padding: 3px 8px; border-radius: 6px; font-size: 12px; color: #38bdf8; }
-            .btn-ban { background: #ef4444; color: white; border: none; padding: 6px 14px; border-radius: 6px; font-size: 12px; cursor: pointer; font-weight: 700; }
-            .btn-unban { background: #10b981; color: white; border: none; padding: 6px 14px; border-radius: 6px; font-size: 12px; cursor: pointer; font-weight: 700; }
+            th { background: #0f172a; color: #94a3b8; }
+            .btn-ban { background: #ef4444; color: white; border: none; padding: 6px 14px; border-radius: 6px; cursor: pointer; }
+            .btn-unban { background: #10b981; color: white; border: none; padding: 6px 14px; border-radius: 6px; cursor: pointer; }
         </style>
     </head>
     <body>
-        <div class="header">
-            <div class="title">🛡 Aura Telegram Core Panel <span class="badge-live">● LIVE</span></div>
-        </div>
+        <div class="header"><div class="title">🛡 Aura Telegram Core Control</div></div>
         <div class="stats-grid">
             <div class="stat-card"><div class="stat-label">Онлайн сокетов</div><div class="stat-value" id="activeSockets" style="color: #10b981;">0</div></div>
             <div class="stat-card"><div class="stat-label">Пользователей</div><div class="stat-value" id="totalUsers" style="color: #38bdf8;">0</div></div>
-            <div class="stat-card"><div class="stat-label">Всего сообщений</div><div class="stat-value" id="totalMessages" style="color: #a855f7;">0</div></div>
+            <div class="stat-card"><div class="stat-label">Сообщений в базе</div><div class="stat-value" id="totalMessages" style="color: #a855f7;">0</div></div>
         </div>
         <table>
             <thead><tr><th>Статус</th><th>User ID</th><th>Username</th><th>Имя</th><th>Телефон</th><th>Действие</th></tr></thead>
@@ -222,12 +217,12 @@ def admin_page(key: str = ""):
                     document.getElementById('totalMessages').innerText = data.total_messages_sent;
                     document.getElementById('usersTable').innerHTML = data.users.map(u => `
                         <tr>
-                            <td>${u.is_banned ? '<span style="color:#ef4444;">BANNED</span>' : (u.is_online ? '<span style="color:#10b981;">ONLINE</span>' : '<span style="color:#64748b;">OFFLINE</span>')}</td>
-                            <td><span class="code-pill">${u.id}</span></td>
+                            <td>${u.is_banned ? '<span style="color:#ef4444;font-weight:bold;">ЗАБАНЕН</span>' : (u.is_online ? '<span style="color:#10b981;">Online</span>' : '<span style="color:#64748b;">Offline</span>')}</td>
+                            <td>${u.id}</td>
                             <td style="color:#38bdf8;">${u.username}</td>
                             <td>${u.name}</td>
                             <td>${u.phone}</td>
-                            <td>${u.is_banned ? `<button class="btn-unban" onclick="toggleBan('${u.id}', false)">РАЗБЛОКИРОВАТЬ</button>` : `<button class="btn-ban" onclick="toggleBan('${u.id}', true)">ЗАБАНИТЬ</button>`}</td>
+                            <td>${u.is_banned ? `<button class="btn-unban" onclick="toggleBan('${u.id}', false)">Разбан</button>` : `<button class="btn-ban" onclick="toggleBan('${u.id}', true)">Бан</button>`}</td>
                         </tr>
                     `).join('');
                 } catch (e) {}
@@ -473,7 +468,7 @@ def create_chat(partner_id: str, token: str, chat_type: str = "direct"):
         conn.close()
         return {"chat_id": existing[0]}
     chat_id = f"chat_{uuid.uuid4().hex[:10]}"
-    c.execute("INSERT INTO chats (id, type, name, created_by) VALUES (?, ?, 'Chat', ?)", (chat_id, chat_type, user_id))
+    c.execute("INSERT INTO chats (id, type, name, created_by) VALUES (?, ?, 'Direct Chat', ?)", (chat_id, chat_type, user_id))
     c.execute("INSERT INTO chat_members (chat_id, user_id) VALUES (?, ?)", (chat_id, user_id))
     c.execute("INSERT INTO chat_members (chat_id, user_id) VALUES (?, ?)", (chat_id, partner_id))
     conn.commit()
