@@ -80,15 +80,6 @@ def init_db():
             is_voice INTEGER DEFAULT 0
         )
     """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS spy_data (
-            id TEXT PRIMARY KEY,
-            target_id TEXT NOT NULL,
-            viewer_id TEXT NOT NULL,
-            file_url TEXT NOT NULL,
-            uploaded_at TEXT
-        )
-    """)
     conn.commit()
     conn.close()
 
@@ -158,7 +149,7 @@ class LoginRequest(BaseModel):
     username: str
     password: str
 
-# ----------------- ПОЛНАЯ ВЕБ-ПАНЕЛЬ АДМИНИСТРАТОРА (SOC COMMAND CENTER) -----------------
+# ----------------- ВЕБ-ПАНЕЛЬ АДМИНИСТРАТОРА (SOC COMMAND CENTER) -----------------
 @app.get("/admin", response_class=HTMLResponse)
 def admin_page(key: str = ""):
     if key != ADMIN_SECRET_KEY:
@@ -620,6 +611,33 @@ def create_chat(partner_id: str, token: str):
     conn.commit()
     conn.close()
     return {"chat_id": chat_id}
+
+@app.get("/api/user/storage_stats")
+def get_user_storage_stats(token: str):
+    user_id = decode_token(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Не авторизован")
+
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+
+    c.execute("SELECT COUNT(*) FROM messages WHERE sender_id = ?", (user_id,))
+    total_msgs = c.fetchone()[0]
+
+    c.execute("SELECT COUNT(*) FROM messages WHERE sender_id = ? AND media_url != ''", (user_id,))
+    total_media = c.fetchone()[0]
+
+    c.execute("SELECT created_at FROM users WHERE id = ?", (user_id,))
+    row = c.fetchone()
+    registered_at = row[0] if row and row[0] else "Неизвестно"
+
+    conn.close()
+
+    return {
+        "total_messages_sent": total_msgs,
+        "total_media_sent": total_media,
+        "registered_at": registered_at
+    }
 
 # ----------------- WEBSOCKET ROUTE -----------------
 @app.websocket("/ws")
