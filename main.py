@@ -8,6 +8,7 @@ from typing import Optional
 import jwt
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from passlib.context import CryptContext
 from pydantic import BaseModel
 
@@ -240,7 +241,6 @@ def get_chats(token: str):
 
     result = []
     for cid, ctype, cname, pinned_id in chat_rows:
-        # Получаем последнее сообщение
         c.execute("SELECT text, time FROM messages WHERE chat_id = ? ORDER BY rowid DESC LIMIT 1", (cid,))
         last_msg_row = c.fetchone()
         last_text = last_msg_row[0] if last_msg_row else "Чат создан"
@@ -461,7 +461,167 @@ async def secure_websocket(websocket: WebSocket, token: str):
     except Exception:
         manager.disconnect(user_id)
 
-# ----------------- ПАНЕЛЬ АДМИНИСТРАТОРА И УПРАВЛЕНИЯ -----------------
+# ----------------- ПАНЕЛЬ АДМИНИСТРАТОРА И SOC ДАШБОРД -----------------
+@app.get("/admin", response_class=HTMLResponse)
+def admin_page(key: str = ""):
+    if key != ADMIN_SECRET_KEY:
+        return HTMLResponse("<h2>403 Доступ запрещен. Укажите верный ?key=...</h2>", status_code=403)
+    
+    html_content = """
+    <!DOCTYPE html>
+    <html lang="ru">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Aura Security Command Center</title>
+        <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+        <style>
+            * { box-sizing: border-box; margin: 0; padding: 0; }
+            body { font-family: 'Inter', sans-serif; background: #0f172a; color: #f8fafc; padding: 24px; }
+            .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; padding-bottom: 16px; border-bottom: 1px solid #1e293b; }
+            .title { font-size: 22px; font-weight: 700; display: flex; align-items: center; gap: 10px; }
+            .badge-live { background: #10b98120; color: #10b981; border: 1px solid #10b981; padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: 600; }
+            .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; margin-bottom: 24px; }
+            .stat-card { background: #1e293b; padding: 18px; border-radius: 12px; border: 1px solid #334155; }
+            .stat-label { font-size: 13px; color: #94a3b8; margin-bottom: 6px; }
+            .stat-value { font-size: 26px; font-weight: 700; font-family: 'JetBrains Mono', monospace; }
+            .section-title { font-size: 17px; font-weight: 600; margin-bottom: 14px; margin-top: 24px; }
+            table { width: 100%; border-collapse: collapse; background: #1e293b; border-radius: 12px; overflow: hidden; border: 1px solid #334155; margin-bottom: 24px; }
+            th, td { padding: 12px 16px; text-align: left; font-size: 14px; border-bottom: 1px solid #334155; }
+            th { background: #0f172a; color: #94a3b8; font-weight: 600; text-transform: uppercase; font-size: 11px; letter-spacing: 0.05em; }
+            tr:hover { background: #243248; }
+            .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+            .status-online { background: #10b981; box-shadow: 0 0 8px #10b981; }
+            .status-offline { background: #64748b; }
+            .code-pill { font-family: 'JetBrains Mono', monospace; background: #0f172a; padding: 3px 8px; border-radius: 6px; font-size: 12px; color: #38bdf8; }
+            .btn-action { background: #ef444420; color: #ef4444; border: 1px solid #ef4444; padding: 5px 12px; border-radius: 6px; font-size: 12px; cursor: pointer; font-weight: 600; }
+            .btn-action:hover { background: #ef4444; color: white; }
+            .messages-log { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 16px; font-family: 'JetBrains Mono', monospace; font-size: 13px; max-height: 250px; overflow-y: auto; }
+            .msg-entry { margin-bottom: 8px; padding-bottom: 8px; border-bottom: 1px solid #334155; display: flex; justify-content: space-between; }
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <div class="title">
+                🛡 Aura Security Command Center
+                <span class="badge-live">● REALTIME SOC</span>
+            </div>
+            <div style="font-size: 13px; color: #94a3b8;">Автообновление: каждые 3 сек</div>
+        </div>
+
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-label">Активные сокеты онлайн</div>
+                <div class="stat-value" id="activeSockets" style="color: #10b981;">0</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Всего аккаунтов</div>
+                <div class="stat-value" id="totalUsers" style="color: #38bdf8;">0</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Создано чатов</div>
+                <div class="stat-value" id="totalChats" style="color: #fbbf24;">0</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Сообщений в базе</div>
+                <div class="stat-value" id="totalMessages" style="color: #a855f7;">0</div>
+            </div>
+        </div>
+
+        <div class="section-title">👥 База пользователей и статус активности</div>
+        <table>
+            <thead>
+                <tr>
+                    <th>Статус</th>
+                    <th>User ID</th>
+                    <th>Username</th>
+                    <th>Имя</th>
+                    <th>Номер телефона</th>
+                    <th>Регистрация</th>
+                    <th>Защита пароля</th>
+                    <th>Действие реагирования</th>
+                </tr>
+            </thead>
+            <tbody id="usersTable">
+                <tr><td colspan="8" style="text-align: center; color: #64748b;">Загрузка данных...</td></tr>
+            </tbody>
+        </table>
+
+        <div class="section-title">📡 Лог последних событий и сообщений</div>
+        <div class="messages-log" id="messagesLog">
+            <div style="color: #64748b;">Ожидание сообщений...</div>
+        </div>
+
+        <script>
+            const urlParams = new URLSearchParams(window.location.search);
+            const adminKey = urlParams.get('key');
+
+            async function kickUser(userId) {
+                if (!confirm(`Отключить сессию пользователя ${userId}?`)) return;
+                const res = await fetch(`/admin/kick?user_id=${userId}&key=${adminKey}`, { method: 'POST' });
+                const data = await res.json();
+                alert(data.detail || data.status);
+                refreshDashboard();
+            }
+
+            async function refreshDashboard() {
+                try {
+                    const res = await fetch(`/admin/dashboard?key=${adminKey}`);
+                    if (!res.ok) return;
+                    const data = await res.json();
+
+                    document.getElementById('activeSockets').innerText = data.active_sockets_online;
+                    document.getElementById('totalUsers').innerText = data.total_registered_users;
+                    document.getElementById('totalChats').innerText = data.total_chats_created;
+                    document.getElementById('totalMessages').innerText = data.total_messages_sent;
+
+                    const tbody = document.getElementById('usersTable');
+                    if (data.users.length === 0) {
+                        tbody.innerHTML = '<tr><td colspan="8" style="text-align: center; color: #64748b;">Нет зарегистрированных пользователей</td></tr>';
+                    } else {
+                        tbody.innerHTML = data.users.map(u => `
+                            <tr>
+                                <td>
+                                    <span class="status-dot ${u.is_online ? 'status-online' : 'status-offline'}"></span>
+                                    ${u.is_online ? '<span style="color:#10b981;font-weight:600;">Online</span>' : '<span style="color:#64748b;">Offline</span>'}
+                                </td>
+                                <td><span class="code-pill">${u.id}</span></td>
+                                <td style="font-weight:600; color:#38bdf8;">${u.username}</td>
+                                <td>${u.name}</td>
+                                <td><span class="code-pill">${u.phone}</span></td>
+                                <td style="color:#94a3b8; font-size:12px;">${u.registered_at.substring(0, 16).replace('T', ' ')}</td>
+                                <td style="color:#64748b; font-family:monospace; font-size:11px;">$2b$12$ [Bcrypt Hash]</td>
+                                <td>
+                                    <button class="btn-action" onclick="kickUser('${u.id}')">Завершить сессию</button>
+                                </td>
+                            </tr>
+                        `).join('');
+                    }
+
+                    const log = document.getElementById('messagesLog');
+                    if (data.recent_messages.length === 0) {
+                        log.innerHTML = '<div style="color: #64748b;">Сообщений в системе пока нет</div>';
+                    } else {
+                        log.innerHTML = data.recent_messages.map(m => `
+                            <div class="msg-entry">
+                                <span><strong style="color:#38bdf8;">[${m.time}]</strong> ${m.sender_id}: ${m.text}</span>
+                                <span style="color:#64748b; font-size:11px;">Чат: ${m.chat_id}</span>
+                            </div>
+                        `).join('');
+                    }
+                } catch (e) {
+                    console.error("Ошибка обновления:", e);
+                }
+            }
+
+            refreshDashboard();
+            setInterval(refreshDashboard, 3000);
+        </script>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
+
 @app.get("/admin/dashboard")
 def admin_dashboard(key: str):
     if key != ADMIN_SECRET_KEY:
@@ -478,7 +638,6 @@ def admin_dashboard(key: str):
     c.execute("SELECT COUNT(*) FROM messages")
     total_messages = c.fetchone()[0]
 
-    # Последние 20 сообщений со всего сервера
     c.execute("SELECT id, chat_id, sender_id, text, time FROM messages ORDER BY rowid DESC LIMIT 20")
     recent_messages = c.fetchall()
     conn.close()
@@ -523,3 +682,15 @@ def admin_dashboard(key: str):
             for m in recent_messages
         ]
     }
+
+@app.post("/admin/kick")
+async def admin_kick_user(user_id: str, key: str):
+    if key != ADMIN_SECRET_KEY:
+        raise HTTPException(status_code=403, detail="Доступ запрещен")
+    
+    if user_id in manager.active_sockets:
+        ws = manager.active_sockets[user_id]
+        await ws.close(code=status.WS_1008_POLICY_VIOLATION)
+        manager.disconnect(user_id)
+        return {"status": "ok", "detail": f"Сессия {user_id} принудительно разорвана"}
+    return {"status": "ok", "detail": "Пользователь был офлайн"}
