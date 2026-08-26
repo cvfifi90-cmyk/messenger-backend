@@ -5,3 +5,5 @@ pyjwt
 passlib[bcrypt]
 bcrypt==4.0.1
 pydantic
+python-multipart
+aiofiles
