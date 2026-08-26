@@ -19,7 +19,7 @@ ACCESS_TOKEN_EXPIRE_DAYS = 30
 ADMIN_SECRET_KEY = "super_admin_secret_pass_123"
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-app = FastAPI(title="Aura Telegram Secure Core & Ban Engine")
+app = FastAPI(title="Aura Telegram Full Production Core")
 
 app.add_middleware(
     CORSMiddleware,
@@ -29,13 +29,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ----------------- ПОСТОЯННАЯ БАЗА ДАННЫХ (SQLITE) -----------------
 DB_FILE = "messenger_secure.db"
 
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    # Таблица пользователей с полем is_banned
     c.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id TEXT PRIMARY KEY,
@@ -48,13 +46,6 @@ def init_db():
             is_banned INTEGER DEFAULT 0
         )
     """)
-    # Проверка и добавление колонки is_banned, если таблица уже существовала
-    c.execute("PRAGMA table_info(users)")
-    columns = [row[1] for row in c.fetchall()]
-    if "is_banned" not in columns:
-        c.execute("ALTER TABLE users ADD COLUMN is_banned INTEGER DEFAULT 0")
-
-    # Таблица чатов
     c.execute("""
         CREATE TABLE IF NOT EXISTS chats (
             id TEXT PRIMARY KEY,
@@ -64,7 +55,6 @@ def init_db():
             pinned_msg_id TEXT
         )
     """)
-    # Участники чатов
     c.execute("""
         CREATE TABLE IF NOT EXISTS chat_members (
             chat_id TEXT NOT NULL,
@@ -72,7 +62,6 @@ def init_db():
             PRIMARY KEY (chat_id, user_id)
         )
     """)
-    # Сообщения
     c.execute("""
         CREATE TABLE IF NOT EXISTS messages (
             id TEXT PRIMARY KEY,
@@ -81,6 +70,8 @@ def init_db():
             text TEXT NOT NULL,
             time TEXT NOT NULL,
             is_voice INTEGER DEFAULT 0,
+            media_type TEXT DEFAULT 'none',
+            media_url TEXT DEFAULT '',
             reactions TEXT DEFAULT '{}'
         )
     """)
@@ -89,7 +80,6 @@ def init_db():
 
 init_db()
 
-# ----------------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ -----------------
 def hash_password(password: str) -> str:
     return pwd_context.hash(password)
 
@@ -98,8 +88,7 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
 
 def create_access_token(user_id: str) -> str:
     expire = datetime.utcnow() + timedelta(days=ACCESS_TOKEN_EXPIRE_DAYS)
-    to_encode = {"sub": user_id, "exp": expire}
-    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return jwt.encode({"sub": user_id, "exp": expire}, SECRET_KEY, algorithm=ALGORITHM)
 
 def decode_token(token: str) -> Optional[str]:
     try:
@@ -116,7 +105,6 @@ def is_user_banned(user_id: str) -> bool:
     conn.close()
     return bool(row and row[0] == 1)
 
-# ----------------- УПРАВЛЕНИЕ WEBSOCKET -----------------
 class SecureConnectionManager:
     def __init__(self):
         self.active_sockets: dict[str, WebSocket] = {}
@@ -148,7 +136,6 @@ class SecureConnectionManager:
 
 manager = SecureConnectionManager()
 
-# ----------------- REST API -----------------
 class RegisterRequest(BaseModel):
     username: str
     password: str
@@ -163,7 +150,7 @@ class LoginRequest(BaseModel):
 def home():
     return {
         "status": "online",
-        "service": "Aura Telegram Secure Core",
+        "service": "Aura Telegram Full Production Core",
         "active_sockets": len(manager.active_sockets),
         "db": "SQLite Persistent"
     }
@@ -269,6 +256,7 @@ def get_chats(token: str):
         avatar_letter = cname[0] if cname else "?"
         is_online = False
         status_text = ""
+        partner_id = ""
 
         if ctype == "personal":
             c.execute("""
@@ -281,6 +269,7 @@ def get_chats(token: str):
             if partner:
                 display_name = partner[0]
                 avatar_letter = partner[0][0]
+                partner_id = partner[2]
                 is_online = partner[2] in manager.active_sockets
                 status_text = "в сети" if is_online else "был(а) недавно"
         elif ctype == "saved":
@@ -296,6 +285,7 @@ def get_chats(token: str):
             "id": cid,
             "type": ctype,
             "name": display_name,
+            "partner_id": partner_id,
             "avatar_letter": avatar_letter,
             "last_message": last_text,
             "time": last_time,
@@ -310,11 +300,8 @@ def get_chats(token: str):
 @app.get("/api/users/search")
 def search_users(query: str, token: str):
     user_id = decode_token(token)
-    if not user_id:
+    if not user_id or is_user_banned(user_id):
         raise HTTPException(status_code=401, detail="Недействительный токен")
-
-    if is_user_banned(user_id):
-        raise HTTPException(status_code=403, detail="Аккаунт заблокирован навсегда")
 
     q = f"%{query.strip().replace('@', '').lower()}%"
     conn = sqlite3.connect(DB_FILE)
@@ -329,7 +316,7 @@ def search_users(query: str, token: str):
 
     return {"results": [{"id": r[0], "username": r[1], "name": r[2], "phone": r[3], "bio": r[4]} for r in rows]}
 
-# ----------------- ЗАЩИЩЕННЫЙ WEBSOCKET -----------------
+# ----------------- ЗАЩИЩЕННЫЙ WEBSOCKET С ПОЛНОЙ МАРШРУТИЗАЦИЕЙ ЗВОНКОВ -----------------
 @app.websocket("/ws")
 async def secure_websocket(websocket: WebSocket, token: str):
     user_id = decode_token(token)
@@ -362,6 +349,8 @@ async def secure_websocket(websocket: WebSocket, token: str):
                 chat_id = data["chat_id"]
                 text = data.get("text", "")
                 is_voice = 1 if data.get("is_voice") else 0
+                media_type = data.get("media_type", "none")
+                media_url = data.get("media_url", "")
                 time_str = datetime.now().strftime("%H:%M")
                 msg_id = f"msg_{uuid.uuid4().hex[:10]}"
 
@@ -376,9 +365,9 @@ async def secure_websocket(websocket: WebSocket, token: str):
                 sender_name = c.fetchone()[0]
 
                 c.execute("""
-                    INSERT INTO messages (id, chat_id, sender_id, text, time, is_voice) 
-                    VALUES (?, ?, ?, ?, ?, ?)
-                """, (msg_id, chat_id, user_id, text, time_str, is_voice))
+                    INSERT INTO messages (id, chat_id, sender_id, text, time, is_voice, media_type, media_url) 
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (msg_id, chat_id, user_id, text, time_str, is_voice, media_type, media_url))
                 conn.commit()
                 conn.close()
 
@@ -392,6 +381,10 @@ async def secure_websocket(websocket: WebSocket, token: str):
                         "text": text,
                         "time": time_str,
                         "is_voice": bool(is_voice),
+                        "media_type": media_type,
+                        "media_url": media_url,
+                        "reply_to_text": data.get("reply_to_text"),
+                        "reply_to_sender": data.get("reply_to_sender"),
                         "reactions": {}
                     }
                 })
@@ -411,6 +404,45 @@ async def secure_websocket(websocket: WebSocket, token: str):
                     "user_name": user_name
                 })
 
+            # --- СИГНАЛИНГ ЗВОНКОВ (P2P WEBRTC CALLING) ---
+            elif action == "call_offer":
+                target_user_id = data["target_user_id"]
+                conn = sqlite3.connect(DB_FILE)
+                c = conn.cursor()
+                c.execute("SELECT name, username FROM users WHERE id = ?", (user_id,))
+                caller_info = c.fetchone()
+                conn.close()
+
+                await manager.send_to_user(target_user_id, {
+                    "type": "incoming_call",
+                    "caller_id": user_id,
+                    "caller_name": caller_info[0],
+                    "caller_username": caller_info[1],
+                    "is_video": data.get("is_video", False),
+                    "channel_id": data.get("channel_id", "")
+                })
+
+            elif action == "call_answer":
+                caller_id = data["caller_id"]
+                await manager.send_to_user(caller_id, {
+                    "type": "call_accepted",
+                    "user_id": user_id,
+                })
+
+            elif action == "call_reject":
+                caller_id = data["caller_id"]
+                await manager.send_to_user(caller_id, {
+                    "type": "call_rejected",
+                    "user_id": user_id,
+                })
+
+            elif action == "call_end":
+                target_id = data["target_id"]
+                await manager.send_to_user(target_id, {
+                    "type": "call_ended",
+                    "user_id": user_id,
+                })
+
             elif action == "add_reaction":
                 chat_id = data["chat_id"]
                 msg_id = data["msg_id"]
@@ -420,12 +452,7 @@ async def secure_websocket(websocket: WebSocket, token: str):
                 c = conn.cursor()
                 c.execute("SELECT reactions FROM messages WHERE id = ?", (msg_id,))
                 row = c.fetchone()
-                reactions_dict = {}
-                if row and row[0]:
-                    try:
-                        reactions_dict = json.loads(row[0])
-                    except Exception:
-                        reactions_dict = {}
+                reactions_dict = json.loads(row[0]) if (row and row[0]) else {}
 
                 reactions_dict[emoji] = reactions_dict.get(emoji, 0) + 1
                 c.execute("UPDATE messages SET reactions = ? WHERE id = ?", (json.dumps(reactions_dict), msg_id))
@@ -437,24 +464,6 @@ async def secure_websocket(websocket: WebSocket, token: str):
                     "chat_id": chat_id,
                     "msg_id": msg_id,
                     "reactions": reactions_dict
-                })
-
-            elif action == "pin_message":
-                chat_id = data["chat_id"]
-                msg_id = data["msg_id"]
-                pinned_text = data.get("text", "")
-
-                conn = sqlite3.connect(DB_FILE)
-                c = conn.cursor()
-                c.execute("UPDATE chats SET pinned_msg_id = ? WHERE id = ?", (msg_id, chat_id))
-                conn.commit()
-                conn.close()
-
-                await manager.broadcast_chat(chat_id, {
-                    "type": "message_pinned",
-                    "chat_id": chat_id,
-                    "msg_id": msg_id,
-                    "text": pinned_text
                 })
 
             elif action == "create_personal_chat":
@@ -493,19 +502,18 @@ async def secure_websocket(websocket: WebSocket, token: str):
     except Exception:
         manager.disconnect(user_id)
 
-# ----------------- ПАНЕЛЬ АДМИНИСТРАТОРА С ФУНКЦИЕЙ МГНОВЕННОГО БАНА -----------------
+# ----------------- ПАНЕЛЬ АДМИНИСТРАТОРА С МГНОВЕННЫМ БАНОМ -----------------
 @app.get("/admin", response_class=HTMLResponse)
 def admin_page(key: str = ""):
     if key != ADMIN_SECRET_KEY:
-        return HTMLResponse("<h2>403 Доступ запрещен. Укажите верный ?key=...</h2>", status_code=403)
+        return HTMLResponse("<h2>403 Доступ запрещен</h2>", status_code=403)
     
     html_content = """
     <!DOCTYPE html>
     <html lang="ru">
     <head>
         <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Aura Security Command Center & Ban Control</title>
+        <title>Aura Telegram Production SOC</title>
         <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
         <style>
             * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -517,140 +525,77 @@ def admin_page(key: str = ""):
             .stat-card { background: #1e293b; padding: 18px; border-radius: 12px; border: 1px solid #334155; }
             .stat-label { font-size: 13px; color: #94a3b8; margin-bottom: 6px; }
             .stat-value { font-size: 26px; font-weight: 700; font-family: 'JetBrains Mono', monospace; }
-            .section-title { font-size: 17px; font-weight: 600; margin-bottom: 14px; margin-top: 24px; }
             table { width: 100%; border-collapse: collapse; background: #1e293b; border-radius: 12px; overflow: hidden; border: 1px solid #334155; margin-bottom: 24px; }
             th, td { padding: 12px 16px; text-align: left; font-size: 14px; border-bottom: 1px solid #334155; }
-            th { background: #0f172a; color: #94a3b8; font-weight: 600; text-transform: uppercase; font-size: 11px; letter-spacing: 0.05em; }
-            tr:hover { background: #243248; }
+            th { background: #0f172a; color: #94a3b8; font-weight: 600; text-transform: uppercase; font-size: 11px; }
             .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
             .status-online { background: #10b981; box-shadow: 0 0 8px #10b981; }
             .status-offline { background: #64748b; }
             .status-banned { background: #ef4444; box-shadow: 0 0 8px #ef4444; }
-            .code-pill { font-family: 'JetBrains Mono', monospace; background: #0f172a; padding: 3px 8px; border-radius: 6px; font-size: 12px; color: #38bdf8; }
             .btn-ban { background: #ef4444; color: white; border: none; padding: 6px 14px; border-radius: 6px; font-size: 12px; cursor: pointer; font-weight: 700; }
-            .btn-ban:hover { background: #dc2626; }
             .btn-unban { background: #10b981; color: white; border: none; padding: 6px 14px; border-radius: 6px; font-size: 12px; cursor: pointer; font-weight: 700; }
-            .btn-unban:hover { background: #059669; }
             .messages-log { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 16px; font-family: 'JetBrains Mono', monospace; font-size: 13px; max-height: 250px; overflow-y: auto; }
             .msg-entry { margin-bottom: 8px; padding-bottom: 8px; border-bottom: 1px solid #334155; display: flex; justify-content: space-between; }
         </style>
     </head>
     <body>
         <div class="header">
-            <div class="title">
-                🛡 Aura Security Center & Ban Control
-                <span class="badge-live">● LIVE</span>
-            </div>
-            <div style="font-size: 13px; color: #94a3b8;">Автообновление каждые 3 сек</div>
+            <div class="title">🛡 Aura Telegram Full Production SOC <span class="badge-live">● LIVE</span></div>
+            <div style="font-size: 13px; color: #94a3b8;">Автообновление: 3 сек</div>
         </div>
 
         <div class="stats-grid">
-            <div class="stat-card">
-                <div class="stat-label">Активные сокеты онлайн</div>
-                <div class="stat-value" id="activeSockets" style="color: #10b981;">0</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">Всего аккаунтов</div>
-                <div class="stat-value" id="totalUsers" style="color: #38bdf8;">0</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">Заблокировано (Banned)</div>
-                <div class="stat-value" id="bannedUsers" style="color: #ef4444;">0</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">Сообщений в базе</div>
-                <div class="stat-value" id="totalMessages" style="color: #a855f7;">0</div>
-            </div>
+            <div class="stat-card"><div class="stat-label">Онлайн (Сокеты)</div><div class="stat-value" id="activeSockets" style="color: #10b981;">0</div></div>
+            <div class="stat-card"><div class="stat-label">Всего пользователей</div><div class="stat-value" id="totalUsers" style="color: #38bdf8;">0</div></div>
+            <div class="stat-card"><div class="stat-label">Заблокировано</div><div class="stat-value" id="bannedUsers" style="color: #ef4444;">0</div></div>
+            <div class="stat-card"><div class="stat-label">Сообщений передано</div><div class="stat-value" id="totalMessages" style="color: #a855f7;">0</div></div>
         </div>
 
-        <div class="section-title">👥 Управление пользователями и блокировкой</div>
+        <h3 style="margin: 16px 0;">Управление аккаунтами и перманентный бан</h3>
         <table>
-            <thead>
-                <tr>
-                    <th>Статус</th>
-                    <th>User ID</th>
-                    <th>Username</th>
-                    <th>Имя</th>
-                    <th>Телефон</th>
-                    <th>Регистрация</th>
-                    <th>Действие бана</th>
-                </tr>
-            </thead>
-            <tbody id="usersTable">
-                <tr><td colspan="7" style="text-align: center; color: #64748b;">Загрузка...</td></tr>
-            </tbody>
+            <thead><tr><th>Статус</th><th>User ID</th><th>Username</th><th>Имя</th><th>Телефон</th><th>Действие</th></tr></thead>
+            <tbody id="usersTable"><tr><td colspan="6">Загрузка...</td></tr></tbody>
         </table>
 
-        <div class="section-title">📡 Лента сообщений в реальном времени</div>
-        <div class="messages-log" id="messagesLog">
-            <div style="color: #64748b;">Ожидание сообщений...</div>
-        </div>
+        <h3 style="margin: 16px 0;">Лента сообщений и звонков</h3>
+        <div class="messages-log" id="messagesLog"><div>Ожидание активности...</div></div>
 
         <script>
-            const urlParams = new URLSearchParams(window.location.search);
-            const adminKey = urlParams.get('key');
+            const adminKey = new URLSearchParams(window.location.search).get('key');
 
             async function toggleBan(userId, banState) {
                 const endpoint = banState ? '/admin/ban' : '/admin/unban';
-                const res = await fetch(`${endpoint}?user_id=${userId}&key=${adminKey}`, { method: 'POST' });
-                const data = await res.json();
-                refreshDashboard();
+                await fetch(`${endpoint}?user_id=${userId}&key=${adminKey}`, { method: 'POST' });
+                refresh();
             }
 
-            async function refreshDashboard() {
+            async function refresh() {
                 try {
                     const res = await fetch(`/admin/dashboard?key=${adminKey}`);
-                    if (!res.ok) return;
                     const data = await res.json();
-
                     document.getElementById('activeSockets').innerText = data.active_sockets_online;
                     document.getElementById('totalUsers').innerText = data.total_registered_users;
                     document.getElementById('bannedUsers').innerText = data.users.filter(u => u.is_banned).length;
                     document.getElementById('totalMessages').innerText = data.total_messages_sent;
 
-                    const tbody = document.getElementById('usersTable');
-                    if (data.users.length === 0) {
-                        tbody.innerHTML = '<tr><td colspan="7" style="text-align: center; color: #64748b;">Нет зарегистрированных пользователей</td></tr>';
-                    } else {
-                        tbody.innerHTML = data.users.map(u => `
-                            <tr style="${u.is_banned ? 'background: #2a1215;' : ''}">
-                                <td>
-                                    ${u.is_banned 
-                                        ? '<span class="status-dot status-banned"></span><span style="color:#ef4444;font-weight:700;">ЗАБЛОКИРОВАН</span>' 
-                                        : (u.is_online 
-                                            ? '<span class="status-dot status-online"></span><span style="color:#10b981;font-weight:600;">Online</span>' 
-                                            : '<span class="status-dot status-offline"></span><span style="color:#64748b;">Offline</span>')}
-                                </td>
-                                <td><span class="code-pill">${u.id}</span></td>
-                                <td style="font-weight:600; color:#38bdf8;">${u.username}</td>
-                                <td>${u.name}</td>
-                                <td><span class="code-pill">${u.phone}</span></td>
-                                <td style="color:#94a3b8; font-size:12px;">${u.registered_at.substring(0, 16).replace('T', ' ')}</td>
-                                <td>
-                                    ${u.is_banned 
-                                        ? `<button class="btn-unban" onclick="toggleBan('${u.id}', false)">РАЗБЛОКИРОВАТЬ</button>` 
-                                        : `<button class="btn-ban" onclick="toggleBan('${u.id}', true)">🔨 ЗАБАНИТЬ НАВСЕГДА</button>`}
-                                </td>
-                            </tr>
-                        `).join('');
-                    }
+                    document.getElementById('usersTable').innerHTML = data.users.map(u => `
+                        <tr>
+                            <td>${u.is_banned ? '<span class="status-dot status-banned"></span><strong style="color:#ef4444">BANNED</strong>' : (u.is_online ? '<span class="status-dot status-online"></span>Online' : '<span class="status-dot status-offline"></span>Offline')}</td>
+                            <td><code>${u.id}</code></td>
+                            <td style="color:#38bdf8; font-weight:bold">${u.username}</td>
+                            <td>${u.name}</td>
+                            <td>${u.phone}</td>
+                            <td>${u.is_banned ? `<button class="btn-unban" onclick="toggleBan('${u.id}', false)">РАЗБЛОКИРОВАТЬ</button>` : `<button class="btn-ban" onclick="toggleBan('${u.id}', true)">🔨 ЗАБАНИТЬ</button>`}</td>
+                        </tr>
+                    `).join('');
 
-                    const log = document.getElementById('messagesLog');
-                    if (data.recent_messages.length === 0) {
-                        log.innerHTML = '<div style="color: #64748b;">Сообщений пока нет</div>';
-                    } else {
-                        log.innerHTML = data.recent_messages.map(m => `
-                            <div class="msg-entry">
-                                <span><strong style="color:#38bdf8;">[${m.time}]</strong> ${m.sender_id}: ${m.text}</span>
-                                <span style="color:#64748b; font-size:11px;">Чат: ${m.chat_id}</span>
-                            </div>
-                        `).join('');
-                    }
+                    document.getElementById('messagesLog').innerHTML = data.recent_messages.map(m => `
+                        <div class="msg-entry"><span><strong>[${m.time}]</strong> ${m.sender_id}: ${m.text}</span><span>${m.chat_id}</span></div>
+                    `).join('');
                 } catch (e) {}
             }
-
-            refreshDashboard();
-            setInterval(refreshDashboard, 3000);
+            refresh();
+            setInterval(refresh, 3000);
         </script>
     </body>
     </html>
@@ -678,7 +623,6 @@ def admin_dashboard(key: str):
     conn.close()
 
     return {
-        "status": "operational",
         "active_sockets_online": len(manager.active_sockets),
         "total_registered_users": len(users),
         "total_chats_created": len(chats),
@@ -729,13 +673,12 @@ async def admin_ban_user(user_id: str, key: str):
     conn.commit()
     conn.close()
 
-    # Мгновенная отправка команды разлогина клиенту перед разрывом сокета
     if user_id in manager.active_sockets:
         ws = manager.active_sockets[user_id]
         try:
             await ws.send_text(json.dumps({
                 "type": "user_banned",
-                "message": "🚨 Ваш аккаунт заблокирован навсегда за нарушение правил безопасности."
+                "message": "🚨 Ваш аккаунт заблокирован навсегда администрацией Aura Telegram."
             }))
             await asyncio.sleep(0.05)
             await ws.close(code=status.WS_1008_POLICY_VIOLATION)
