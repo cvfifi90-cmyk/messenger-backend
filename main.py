@@ -1,36 +1,45 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+import asyncio
 import json
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 app = FastAPI()
 
 class ConnectionManager:
     def __init__(self):
-        self.active_connections: list[WebSocket] = []
+        self.active_connections: dict[str, WebSocket] = {}
 
-    async def connect(self, websocket: WebSocket):
+    async def connect(self, websocket: WebSocket, user_id: str):
         await websocket.accept()
-        self.active_connections.append(websocket)
+        self.active_connections[user_id] = websocket
 
-    def disconnect(self, websocket: WebSocket):
-        if websocket in self.active_connections:
-            self.active_connections.remove(websocket)
+    def disconnect(self, user_id: str):
+        if user_id in self.active_connections:
+            del self.active_connections[user_id]
 
     async def broadcast(self, data: dict):
-        for connection in self.active_connections:
+        for user_id, connection in list(self.active_connections.items()):
             try:
                 await connection.send_text(json.dumps(data))
             except Exception:
-                pass
+                self.disconnect(user_id)
 
 manager = ConnectionManager()
 
 @app.websocket("/ws/{user_id}")
 async def websocket_endpoint(websocket: WebSocket, user_id: str):
-    await manager.connect(websocket)
+    await manager.connect(websocket, user_id)
     try:
         while True:
             raw_data = await websocket.receive_text()
             message_data = json.loads(raw_data)
+            
+            # Ответ на пинг для поддержания соединения активным
+            if message_data.get("type") == "ping":
+                await websocket.send_text(json.dumps({"type": "pong"}))
+                continue
+
             await manager.broadcast(message_data)
     except WebSocketDisconnect:
-        manager.disconnect(websocket)
+        manager.disconnect(user_id)
+    except Exception:
+        manager.disconnect(user_id)
