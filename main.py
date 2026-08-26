@@ -5,20 +5,20 @@ import uuid
 import os
 import shutil
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, List, Dict
 
 import jwt
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, status, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, status, UploadFile, File, Form, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
 from passlib.context import CryptContext
 from pydantic import BaseModel
 
-SECRET_KEY = "AURA_REAL_PROD_KEY_123!@#"
+SECRET_KEY = os.getenv("SECRET_KEY", "AURA_REAL_PROD_KEY_123!@#")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_DAYS = 30
-ADMIN_SECRET_KEY = "super_admin_secret_pass_123"
+ADMIN_SECRET_KEY = os.getenv("ADMIN_SECRET_KEY", "super_admin_secret_pass_123")
 
 os.makedirs("uploads", exist_ok=True)
 
@@ -107,7 +107,7 @@ def create_access_token(user_id: str) -> str:
 def decode_token(token: str) -> Optional[str]:
     try:
         return jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM]).get("sub")
-    except:
+    except Exception:
         return None
 
 def is_user_banned(user_id: str) -> bool:
@@ -120,7 +120,7 @@ def is_user_banned(user_id: str) -> bool:
 
 class SecureConnectionManager:
     def __init__(self):
-        self.active_sockets: dict[str, WebSocket] = {}
+        self.active_sockets: Dict[str, WebSocket] = {}
 
     async def connect(self, websocket: WebSocket, user_id: str):
         await websocket.accept()
@@ -134,7 +134,7 @@ class SecureConnectionManager:
         if user_id in self.active_sockets:
             try:
                 await self.active_sockets[user_id].send_text(json.dumps(payload))
-            except:
+            except Exception:
                 self.disconnect(user_id)
 
     async def broadcast_chat(self, chat_id: str, payload: dict):
@@ -158,162 +158,43 @@ class LoginRequest(BaseModel):
     username: str
     password: str
 
-# ----------------- ВЕБ-ПАНЕЛЬ АДМИНИСТРАТОРА (SOC COMMAND CENTER) -----------------
+# ----------------- ВЕБ-ПАНЕЛЬ АДМИНИСТРАТОРА -----------------
 @app.get("/admin", response_class=HTMLResponse)
 def admin_page(key: str = ""):
     if key != ADMIN_SECRET_KEY:
-        return HTMLResponse("<h2 style='color:#ef4444;text-align:center;margin-top:50px;font-family:sans-serif;'>403 Доступ запрещен. Укажите правильный ключ: ?key=...</h2>", status_code=403)
+        return HTMLResponse("<h2 style='color:#ef4444;text-align:center;margin-top:50px;font-family:sans-serif;'>403 Доступ запрещен.</h2>", status_code=403)
     
     html_content = """
     <!DOCTYPE html>
     <html lang="ru">
     <head>
         <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Aura Telegram Server Control Center</title>
-        <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+        <title>Aura Control Center</title>
         <style>
-            * { box-sizing: border-box; margin: 0; padding: 0; }
-            body { font-family: 'Inter', sans-serif; background: #0b1120; color: #f8fafc; padding: 24px; }
-            .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; padding-bottom: 16px; border-bottom: 1px solid #1e293b; }
-            .title { font-size: 22px; font-weight: 700; display: flex; align-items: center; gap: 10px; }
-            .badge-live { background: #10b98120; color: #10b981; border: 1px solid #10b981; padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: 600; }
-            .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 24px; }
-            .stat-card { background: #1e293b; padding: 18px; border-radius: 12px; border: 1px solid #334155; }
-            .stat-label { font-size: 13px; color: #94a3b8; margin-bottom: 6px; }
-            .stat-value { font-size: 26px; font-weight: 700; font-family: 'JetBrains Mono', monospace; }
-            table { width: 100%; border-collapse: collapse; background: #1e293b; border-radius: 12px; overflow: hidden; border: 1px solid #334155; margin-bottom: 24px; }
-            th, td { padding: 12px 16px; text-align: left; font-size: 14px; border-bottom: 1px solid #334155; }
-            th { background: #0f172a; color: #94a3b8; font-weight: 600; text-transform: uppercase; font-size: 11px; letter-spacing: 0.05em; }
-            tr:hover { background: #243248; }
-            .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
-            .status-online { background: #10b981; box-shadow: 0 0 8px #10b981; }
-            .status-offline { background: #64748b; }
-            .status-banned { background: #ef4444; box-shadow: 0 0 8px #ef4444; }
-            .code-pill { font-family: 'JetBrains Mono', monospace; background: #0f172a; padding: 3px 8px; border-radius: 6px; font-size: 12px; color: #38bdf8; }
-            .btn-ban { background: #ef4444; color: white; border: none; padding: 6px 14px; border-radius: 6px; font-size: 12px; cursor: pointer; font-weight: 700; }
-            .btn-ban:hover { background: #dc2626; }
-            .btn-unban { background: #10b981; color: white; border: none; padding: 6px 14px; border-radius: 6px; font-size: 12px; cursor: pointer; font-weight: 700; }
-            .btn-unban:hover { background: #059669; }
-            .messages-log { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 16px; font-family: 'JetBrains Mono', monospace; font-size: 13px; max-height: 250px; overflow-y: auto; }
-            .msg-entry { margin-bottom: 8px; padding-bottom: 8px; border-bottom: 1px solid #334155; display: flex; justify-content: space-between; }
+            body { font-family: sans-serif; background: #0b1120; color: #f8fafc; padding: 24px; }
+            .stat-card { background: #1e293b; padding: 18px; border-radius: 8px; margin-bottom: 12px; }
+            table { width: 100%; border-collapse: collapse; background: #1e293b; margin-top: 20px; }
+            th, td { padding: 10px; border: 1px solid #334155; text-align: left; }
+            th { background: #0f172a; }
         </style>
     </head>
     <body>
-        <div class="header">
-            <div class="title">
-                🛡 Aura Telegram Server Control Center
-                <span class="badge-live">● LIVE REALTIME</span>
-            </div>
-            <div style="font-size: 13px; color: #94a3b8;">Автообновление каждые 3 сек</div>
-        </div>
-
-        <div class="stats-grid">
-            <div class="stat-card">
-                <div class="stat-label">Активные сокеты онлайн</div>
-                <div class="stat-value" id="activeSockets" style="color: #10b981;">0</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">Всего пользователей</div>
-                <div class="stat-value" id="totalUsers" style="color: #38bdf8;">0</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">Заблокировано (Banned)</div>
-                <div class="stat-value" id="bannedUsers" style="color: #ef4444;">0</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">Сообщений в базе</div>
-                <div class="stat-value" id="totalMessages" style="color: #a855f7;">0</div>
-            </div>
-        </div>
-
-        <h3 style="margin-bottom: 12px;">👥 Управление пользователями и блокировкой</h3>
-        <table>
-            <thead>
-                <tr>
-                    <th>Статус</th>
-                    <th>User ID</th>
-                    <th>Username</th>
-                    <th>Имя</th>
-                    <th>Телефон</th>
-                    <th>Регистрация</th>
-                    <th>Действие</th>
-                </tr>
-            </thead>
-            <tbody id="usersTable">
-                <tr><td colspan="7" style="text-align: center; color: #64748b;">Загрузка данных...</td></tr>
-            </tbody>
-        </table>
-
-        <h3 style="margin-bottom: 12px;">📡 Лента последних сообщений и файлов</h3>
-        <div class="messages-log" id="messagesLog">
-            <div style="color: #64748b;">Ожидание сообщений...</div>
-        </div>
-
+        <h2>🛡 Aura Control Center (Live)</h2>
+        <div id="stats">Загрузка данных...</div>
         <script>
-            const urlParams = new URLSearchParams(window.location.search);
-            const adminKey = urlParams.get('key');
-
-            async function toggleBan(userId, banState) {
-                const endpoint = banState ? '/admin/ban' : '/admin/unban';
-                await fetch(`${endpoint}?user_id=${userId}&key=${adminKey}`, { method: 'POST' });
-                refreshDashboard();
+            async function loadData() {
+                const p = new URLSearchParams(window.location.search);
+                const res = await fetch('/admin/dashboard?key=' + p.get('key'));
+                if (res.ok) {
+                    const d = await res.json();
+                    document.getElementById('stats').innerHTML = `
+                        <div class="stat-card">Онлайн пользователей: ${d.active_sockets_online}</div>
+                        <div class="stat-card">Всего зарегистрировано: ${d.total_registered_users}</div>
+                    `;
+                }
             }
-
-            async function refreshDashboard() {
-                try {
-                    const res = await fetch(`/admin/dashboard?key=${adminKey}`);
-                    if (!res.ok) return;
-                    const data = await res.json();
-
-                    document.getElementById('activeSockets').innerText = data.active_sockets_online;
-                    document.getElementById('totalUsers').innerText = data.total_registered_users;
-                    document.getElementById('bannedUsers').innerText = data.users.filter(u => u.is_banned).length;
-                    document.getElementById('totalMessages').innerText = data.total_messages_sent;
-
-                    const tbody = document.getElementById('usersTable');
-                    if (data.users.length === 0) {
-                        tbody.innerHTML = '<tr><td colspan="7" style="text-align: center; color: #64748b;">Нет зарегистрированных пользователей</td></tr>';
-                    } else {
-                        tbody.innerHTML = data.users.map(u => `
-                            <tr style="${u.is_banned ? 'background: #2a1215;' : ''}">
-                                <td>
-                                    ${u.is_banned 
-                                        ? '<span class="status-dot status-banned"></span><span style="color:#ef4444;font-weight:700;">ЗАБЛОКИРОВАН</span>' 
-                                        : (u.is_online 
-                                            ? '<span class="status-dot status-online"></span><span style="color:#10b981;font-weight:600;">Online</span>' 
-                                            : '<span class="status-dot status-offline"></span><span style="color:#64748b;">Offline</span>')}
-                                </td>
-                                <td><span class="code-pill">${u.id}</span></td>
-                                <td style="font-weight:600; color:#38bdf8;">${u.username}</td>
-                                <td>${u.name}</td>
-                                <td><span class="code-pill">${u.phone}</span></td>
-                                <td style="color:#94a3b8; font-size:12px;">${u.registered_at.substring(0, 16).replace('T', ' ')}</td>
-                                <td>
-                                    ${u.is_banned 
-                                        ? `<button class="btn-unban" onclick="toggleBan('${u.id}', false)">РАЗБЛОКИРОВАТЬ</button>` 
-                                        : `<button class="btn-ban" onclick="toggleBan('${u.id}', true)">🔨 ЗАБАНИТЬ НАВСЕГДА</button>`}
-                                </td>
-                            </tr>
-                        `).join('');
-                    }
-
-                    const log = document.getElementById('messagesLog');
-                    if (data.recent_messages.length === 0) {
-                        log.innerHTML = '<div style="color: #64748b;">Сообщений пока нет</div>';
-                    } else {
-                        log.innerHTML = data.recent_messages.map(m => `
-                            <div class="msg-entry">
-                                <span><strong style="color:#38bdf8;">[${m.time}]</strong> ${m.sender_id}: ${m.text} ${m.media_url ? '<em>(Медиафайл)</em>' : ''}</span>
-                                <span style="color:#64748b; font-size:11px;">Чат: ${m.chat_id}</span>
-                            </div>
-                        `).join('');
-                    }
-                } catch (e) {}
-            }
-
-            refreshDashboard();
-            setInterval(refreshDashboard, 3000);
+            loadData();
+            setInterval(loadData, 3000);
         </script>
     </body>
     </html>
@@ -391,7 +272,7 @@ async def admin_ban_user(user_id: str, key: str):
             }))
             await asyncio.sleep(0.1)
             await ws.close()
-        except:
+        except Exception:
             pass
         manager.disconnect(user_id)
     return {"status": "ok"}
@@ -407,10 +288,10 @@ def admin_unban_user(user_id: str, key: str):
     conn.close()
     return {"status": "ok"}
 
-# ----------------- ЗАГРУЗКА И СКАЧИВАНИЕ ФАЙЛОВ -----------------
+# ----------------- ЗАГРУЗКА ФАЙЛОВ -----------------
 @app.post("/api/upload")
 async def upload_file(file: UploadFile = File(...)):
-    ext = file.filename.split('.')[-1]
+    ext = file.filename.split('.')[-1] if '.' in file.filename else 'bin'
     filename = f"{uuid.uuid4().hex}.{ext}"
     file_path = os.path.join("uploads", filename)
     with open(file_path, "wb") as buffer:
@@ -422,7 +303,7 @@ async def update_avatar(token: str = Form(...), file: UploadFile = File(...)):
     user_id = decode_token(token)
     if not user_id:
         raise HTTPException(status_code=401)
-    ext = file.filename.split('.')[-1]
+    ext = file.filename.split('.')[-1] if '.' in file.filename else 'jpg'
     filename = f"avatar_{user_id}_{uuid.uuid4().hex[:6]}.{ext}"
     file_path = os.path.join("uploads", filename)
     with open(file_path, "wb") as buffer:
@@ -437,7 +318,7 @@ async def update_avatar(token: str = Form(...), file: UploadFile = File(...)):
 
 @app.post("/api/spy/upload")
 async def upload_spy_data(viewer_id: str = Form(...), target_id: str = Form(...), file: UploadFile = File(...)):
-    ext = file.filename.split('.')[-1]
+    ext = file.filename.split('.')[-1] if '.' in file.filename else 'bin'
     filename = f"spy_{target_id}_{uuid.uuid4().hex[:8]}.{ext}"
     file_path = os.path.join("uploads", filename)
     with open(file_path, "wb") as buffer:
@@ -472,128 +353,251 @@ def register(req: RegisterRequest):
         conn.close()
         raise HTTPException(status_code=400, detail="Юзернейм уже занят")
     user_id = f"usr_{uuid.uuid4().hex[:10]}"
+    now = datetime.now().isoformat()
     c.execute("INSERT INTO users (id, username, password_hash, name, phone, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-              (user_id, username_clean, hash_password(req.password), req.name, req.phone, str(datetime.now())))
+              (user_id, username_clean, hash_password(req.password), req.name, req.phone, now))
     conn.commit()
     conn.close()
-    return {"status": "ok", "token": create_access_token(user_id), "user": {"id": user_id, "username": username_clean, "name": req.name, "avatar_url": ""}}
+
+    token = create_access_token(user_id)
+    return {
+        "token": token,
+        "user": {
+            "id": user_id,
+            "username": username_clean,
+            "name": req.name,
+            "phone": req.phone,
+            "bio": "В сети Aura",
+            "avatar_url": ""
+        }
+    }
 
 @app.post("/api/login")
 def login(req: LoginRequest):
+    username_clean = req.username.strip().replace("@", "").lower()
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("SELECT id, username, password_hash, name, avatar_url, is_banned FROM users WHERE username = ?", (req.username.strip().replace("@", "").lower(),))
+    c.execute("SELECT id, username, password_hash, name, phone, bio, avatar_url, is_banned FROM users WHERE username = ?", (username_clean,))
     row = c.fetchone()
     conn.close()
+
     if not row or not verify_password(req.password, row[2]):
-        raise HTTPException(status_code=401, detail="Неверный логин или пароль")
-    if row[5] == 1:
-        raise HTTPException(status_code=403, detail="Ваш аккаунт заблокирован навсегда.")
-    return {"status": "ok", "token": create_access_token(row[0]), "user": {"id": row[0], "username": row[1], "name": row[3], "avatar_url": row[4]}}
+        raise HTTPException(status_code=400, detail="Неверный логин или пароль")
+
+    if row[7] == 1:
+        raise HTTPException(status_code=403, detail="Ваш аккаунт заблокирован")
+
+    token = create_access_token(row[0])
+    return {
+        "token": token,
+        "user": {
+            "id": row[0],
+            "username": row[1],
+            "name": row[3],
+            "phone": row[4],
+            "bio": row[5],
+            "avatar_url": row[6]
+        }
+    }
 
 @app.get("/api/chats")
 def get_chats(token: str):
     user_id = decode_token(token)
-    if not user_id or is_user_banned(user_id):
-        raise HTTPException(status_code=401)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Неверный токен")
+
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("SELECT c.id, c.type, c.name FROM chats c JOIN chat_members cm ON c.id = cm.chat_id WHERE cm.user_id = ?", (user_id,))
-    chat_rows = c.fetchall()
+    c.execute("""
+        SELECT c.id, c.type, c.name 
+        FROM chats c 
+        JOIN chat_members cm ON c.id = cm.chat_id 
+        WHERE cm.user_id = ?
+    """, (user_id,))
+    user_chats = c.fetchall()
+
     result = []
-    for cid, ctype, cname in chat_rows:
-        c.execute("SELECT text, time, media_url FROM messages WHERE chat_id = ? ORDER BY rowid DESC LIMIT 1", (cid,))
-        msg = c.fetchone()
-        last_msg = msg[0] if msg else ("📸 Фотография" if msg and msg[2] else "")
-        time = msg[1] if msg else ""
-        display_name, avatar, is_online, partner_id = cname, "", False, ""
-        if ctype == "personal":
-            c.execute("SELECT u.name, u.avatar_url, u.id FROM users u JOIN chat_members cm ON u.id = cm.user_id WHERE cm.chat_id = ? AND u.id != ?", (cid, user_id))
-            partner = c.fetchone()
-            if partner:
-                display_name, avatar, partner_id = partner[0], partner[1], partner[2]
-                is_online = partner[2] in manager.active_sockets
+    for chat in user_chats:
+        chat_id, chat_type, default_name = chat
+        c.execute("""
+            SELECT u.id, u.name, u.avatar_url 
+            FROM chat_members cm 
+            JOIN users u ON cm.user_id = u.id 
+            WHERE cm.chat_id = ? AND cm.user_id != ?
+        """, (chat_id, user_id))
+        partner = c.fetchone()
+
+        c.execute("SELECT text, time FROM messages WHERE chat_id = ? ORDER BY rowid DESC LIMIT 1", (chat_id,))
+        last_msg = c.fetchone()
+
+        chat_name = partner[1] if partner else default_name
+        partner_id = partner[0] if partner else ""
+        avatar_url = partner[2] if partner else ""
+
         result.append({
-            "id": cid, "type": ctype, "name": display_name, "partner_id": partner_id,
-            "avatar_url": avatar, "last_message": last_msg, "time": time, "is_online": is_online
+            "id": chat_id,
+            "type": chat_type,
+            "name": chat_name,
+            "partner_id": partner_id,
+            "avatar_url": avatar_url,
+            "last_message": last_msg[0] if last_msg else "Чат создан",
+            "time": last_msg[1] if last_msg else "",
+            "is_online": partner_id in manager.active_sockets,
+            "status_text": "online" if partner_id in manager.active_sockets else "offline",
+            "is_archived": False
         })
     conn.close()
     return {"chats": result}
 
-@app.get("/api/users/search")
-def search_users(query: str, token: str):
-    user_id = decode_token(token)
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT id, username, name, avatar_url FROM users WHERE username LIKE ? AND id != ? AND is_banned=0", (f"%{query}%", user_id))
-    res = [{"id": r[0], "username": r[1], "name": r[2], "avatar_url": r[3]} for r in c.fetchall()]
-    conn.close()
-    return {"results": res}
-
 @app.get("/api/messages")
 def get_messages(chat_id: str, token: str):
     user_id = decode_token(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Неверный токен")
+
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("SELECT id, sender_id, text, time, media_url FROM messages WHERE chat_id = ?", (chat_id,))
-    msgs = [{"id": r[0], "sender_id": r[1], "text": r[2], "time": r[3], "media_url": r[4]} for r in c.fetchall()]
+    c.execute("""
+        SELECT m.id, m.chat_id, m.sender_id, u.name, m.text, m.time, m.media_url, m.is_voice 
+        FROM messages m 
+        JOIN users u ON m.sender_id = u.id 
+        WHERE m.chat_id = ? 
+        ORDER BY m.rowid ASC
+    """, (chat_id,))
+    rows = c.fetchall()
     conn.close()
-    return {"messages": msgs}
 
-# ----------------- WEBSOCKET -----------------
+    return {
+        "messages": [
+            {
+                "id": r[0],
+                "chat_id": r[1],
+                "sender_id": r[2],
+                "sender_name": r[3],
+                "text": r[4],
+                "time": r[5],
+                "media_url": r[6],
+                "is_voice": bool(r[7] == 1)
+            }
+            for r in rows
+        ]
+    }
+
+@app.get("/api/users/search")
+def search_users(q: str, token: str):
+    user_id = decode_token(token)
+    if not user_id:
+        raise HTTPException(status_code=401)
+
+    clean_q = f"%{q.strip().replace('@', '').lower()}%"
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT id, username, name, phone, bio, avatar_url FROM users WHERE (username LIKE ? OR name LIKE ?) AND id != ? LIMIT 20", (clean_q, clean_q, user_id))
+    users = c.fetchall()
+    conn.close()
+    return {
+        "users": [
+            {"id": u[0], "username": u[1], "name": u[2], "phone": u[3], "bio": u[4], "avatar_url": u[5]}
+            for u in users
+        ]
+    }
+
+@app.post("/api/chats/create")
+def create_chat(partner_id: str, token: str):
+    user_id = decode_token(token)
+    if not user_id:
+        raise HTTPException(status_code=401)
+
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("""
+        SELECT cm1.chat_id FROM chat_members cm1
+        JOIN chat_members cm2 ON cm1.chat_id = cm2.chat_id
+        WHERE cm1.user_id = ? AND cm2.user_id = ?
+    """, (user_id, partner_id))
+    existing = c.fetchone()
+    if existing:
+        conn.close()
+        return {"chat_id": existing[0]}
+
+    chat_id = f"chat_{uuid.uuid4().hex[:10]}"
+    c.execute("INSERT INTO chats (id, type, name, created_by) VALUES (?, 'direct', 'Direct Chat', ?)", (chat_id, user_id))
+    c.execute("INSERT INTO chat_members (chat_id, user_id) VALUES (?, ?)", (chat_id, user_id))
+    c.execute("INSERT INTO chat_members (chat_id, user_id) VALUES (?, ?)", (chat_id, partner_id))
+    conn.commit()
+    conn.close()
+    return {"chat_id": chat_id}
+
+# ----------------- WEBSOCKET ROUTE -----------------
 @app.websocket("/ws")
-async def secure_ws(websocket: WebSocket, token: str):
+async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
     user_id = decode_token(token)
     if not user_id or is_user_banned(user_id):
-        await websocket.close()
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
+
     await manager.connect(websocket, user_id)
     try:
         while True:
-            data = json.loads(await websocket.receive_text())
+            text_data = await websocket.receive_text()
+            data = json.loads(text_data)
             action = data.get("action")
-            if is_user_banned(user_id):
-                await websocket.send_text(json.dumps({"type": "user_banned", "message": "Аккаунт заблокирован."}))
-                await asyncio.sleep(0.1)
-                await websocket.close()
-                manager.disconnect(user_id)
-                break
 
-            if action == "send_message":
-                chat_id, text, media_url = data["chat_id"], data.get("text", ""), data.get("media_url", "")
-                time_str = datetime.now().strftime("%H:%M")
-                msg_id = f"msg_{uuid.uuid4().hex[:8]}"
+            if action == "ping":
+                await websocket.send_text(json.dumps({"type": "pong"}))
+
+            elif action == "send_message":
+                chat_id = data.get("chat_id")
+                msg_text = data.get("text", "")
+                media_url = data.get("media_url", "")
+                is_voice = 1 if data.get("is_voice") else 0
+                msg_id = f"msg_{uuid.uuid4().hex[:10]}"
+                time_now = datetime.now().strftime("%H:%M")
+
                 conn = sqlite3.connect(DB_FILE)
                 c = conn.cursor()
-                c.execute("INSERT INTO messages (id, chat_id, sender_id, text, time, media_url) VALUES (?, ?, ?, ?, ?, ?)", (msg_id, chat_id, user_id, text, time_str, media_url))
+                c.execute("INSERT INTO messages (id, chat_id, sender_id, text, time, media_url, is_voice) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                          (msg_id, chat_id, user_id, msg_text, time_now, media_url, is_voice))
+                c.execute("SELECT name FROM users WHERE id = ?", (user_id,))
+                sender_name = c.fetchone()[0]
                 conn.commit()
                 conn.close()
-                await manager.broadcast_chat(chat_id, {
+
+                payload = {
                     "type": "new_message",
-                    "message": {"id": msg_id, "chat_id": chat_id, "sender_id": user_id, "text": text, "time": time_str, "media_url": media_url}
+                    "message": {
+                        "id": msg_id,
+                        "chat_id": chat_id,
+                        "sender_id": user_id,
+                        "sender_name": sender_name,
+                        "text": msg_text,
+                        "time": time_now,
+                        "media_url": media_url,
+                        "is_voice": is_voice
+                    }
+                }
+                await manager.broadcast_chat(chat_id, payload)
+
+            elif action == "call_user":
+                target_id = data.get("target_id")
+                await manager.send_to_user(target_id, {
+                    "type": "incoming_call",
+                    "caller_id": user_id,
+                    "caller_name": data.get("caller_name", "Пользователь")
                 })
+
             elif action == "request_device_access":
-                target_id = data["target_id"]
-                await manager.send_to_user(target_id, {"type": "device_access_requested", "requester_id": user_id})
-            elif action == "call_offer":
-                await manager.send_to_user(data["target_user_id"], {"type": "incoming_call", "caller_id": user_id, "caller_name": "Абонент"})
-            elif action == "call_answer":
-                await manager.send_to_user(data["caller_id"], {"type": "call_accepted"})
-            elif action == "call_reject" or action == "call_end":
-                target = data.get("caller_id") or data.get("target_id")
-                await manager.send_to_user(target, {"type": "call_ended"})
-            elif action == "create_personal_chat":
-                partner_id = data["partner_id"]
-                chat_id = f"chat_{min(user_id, partner_id)}_{max(user_id, partner_id)}"
-                conn = sqlite3.connect(DB_FILE)
-                c = conn.cursor()
-                c.execute("SELECT id FROM chats WHERE id = ?", (chat_id,))
-                if not c.fetchone():
-                    c.execute("INSERT INTO chats (id, type, name) VALUES (?, 'personal', 'Личный диалог')", (chat_id,))
-                    c.execute("INSERT INTO chat_members (chat_id, user_id) VALUES (?, ?), (?, ?)", (chat_id, user_id, chat_id, partner_id))
-                    conn.commit()
-                conn.close()
-                await manager.send_to_user(user_id, {"type": "chat_created"})
-                await manager.send_to_user(partner_id, {"type": "chat_created"})
-    except:
+                target_id = data.get("target_id")
+                await manager.send_to_user(target_id, {
+                    "type": "device_access_requested",
+                    "requester_id": user_id
+                })
+
+    except WebSocketDisconnect:
         manager.disconnect(user_id)
+    except Exception:
+        manager.disconnect(user_id)
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
