@@ -1,282 +1,395 @@
 import asyncio
 import json
+import sqlite3
 import uuid
-from datetime import datetime
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from datetime import datetime, timedelta
+from typing import Optional
+
+import jwt
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, status
+from fastapi.middleware.cors import CORSMiddleware
+from passlib.context import CryptContext
 from pydantic import BaseModel
 
-app = FastAPI()
+# ----------------- КОНФИГУРАЦИЯ БЕЗОПАСНОСТИ -----------------
+SECRET_KEY = "AURA_SUPER_SECRET_MILITARY_KEY_CHANGE_THIS_IN_PROD_123!@#"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_DAYS = 30
 
-# База данных в памяти сервера
-users_db = {}        # user_id: {id, username, name, phone, bio, avatar_color, online, last_seen}
-chats_db = {}        # chat_id: {id, type, name, members: [user_id], created_by, pinned_msg_id}
-messages_db = {}     # chat_id: [ {id, sender_id, sender_name, text, time, reactions, is_pinned, is_voice, media_url} ]
-active_sockets = {}  # user_id: WebSocket
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+app = FastAPI(title="Aura Telegram Secure Core")
 
-class ConnectionManager:
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ----------------- ПОСТОЯННАЯ БАЗА ДАННЫХ (SQLITE) -----------------
+DB_FILE = "messenger_secure.db"
+
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    # Таблица пользователей
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id TEXT PRIMARY KEY,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            name TEXT NOT NULL,
+            phone TEXT NOT NULL,
+            bio TEXT DEFAULT '',
+            created_at TEXT
+        )
+    """)
+    # Таблица чатов
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS chats (
+            id TEXT PRIMARY KEY,
+            type TEXT NOT NULL,
+            name TEXT NOT NULL,
+            created_by TEXT,
+            pinned_msg_id TEXT
+        )
+    """)
+    # Участники чатов
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS chat_members (
+            chat_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            PRIMARY KEY (chat_id, user_id)
+        )
+    """)
+    # Сообщения
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
+            id TEXT PRIMARY KEY,
+            chat_id TEXT NOT NULL,
+            sender_id TEXT NOT NULL,
+            text TEXT NOT NULL,
+            time TEXT NOT NULL,
+            is_voice INTEGER DEFAULT 0,
+            reactions TEXT DEFAULT '{}'
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# ----------------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ КРИПТОГРАФИИ -----------------
+def hash_password(password: str) -> str:
+    return pwd_context.hash(password)
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
+
+def create_access_token(user_id: str) -> str:
+    expire = datetime.utcnow() + timedelta(days=ACCESS_TOKEN_EXPIRE_DAYS)
+    to_encode = {"sub": user_id, "exp": expire}
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+def decode_token(token: str) -> Optional[str]:
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        return payload.get("sub")
+    except Exception:
+        return None
+
+# ----------------- УПРАВЛЕНИЕ WEBSOCKET-СОЕДИНЕНИЯМИ -----------------
+class SecureConnectionManager:
+    def __init__(self):
+        self.active_sockets: dict[str, WebSocket] = {}
+
     async def connect(self, websocket: WebSocket, user_id: str):
         await websocket.accept()
-        active_sockets[user_id] = websocket
-        if user_id in users_db:
-            users_db[user_id]["online"] = True
-            await self.broadcast_user_status(user_id, True)
+        self.active_sockets[user_id] = websocket
 
     def disconnect(self, user_id: str):
-        if user_id in active_sockets:
-            del active_sockets[user_id]
-        if user_id in users_db:
-            users_db[user_id]["online"] = False
-            users_db[user_id]["last_seen"] = datetime.now().strftime("%H:%M")
-            asyncio.create_task(self.broadcast_user_status(user_id, False))
+        if user_id in self.active_sockets:
+            del self.active_sockets[user_id]
 
-    async def broadcast_user_status(self, user_id: str, is_online: bool):
-        payload = {
-            "type": "status_update",
-            "user_id": user_id,
-            "online": is_online,
-            "last_seen": users_db[user_id].get("last_seen", "недавно")
-        }
-        for ws in list(active_sockets.values()):
+    async def send_to_user(self, user_id: str, payload: dict):
+        if user_id in self.active_sockets:
             try:
-                await ws.send_text(json.dumps(payload))
+                await self.active_sockets[user_id].send_text(json.dumps(payload))
             except Exception:
-                pass
+                self.disconnect(user_id)
 
-    async def send_personal(self, user_id: str, message: dict):
-        if user_id in active_sockets:
-            try:
-                await active_sockets[user_id].send_text(json.dumps(message))
-            except Exception:
-                pass
+    async def broadcast_chat(self, chat_id: str, payload: dict):
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT user_id FROM chat_members WHERE chat_id = ?", (chat_id,))
+        members = [row[0] for row in c.fetchall()]
+        conn.close()
 
-    async def broadcast_to_chat(self, chat_id: str, message: dict):
-        chat = chats_db.get(chat_id)
-        if not chat:
-            return
-        for member_id in chat["members"]:
-            await self.send_personal(member_id, message)
+        for member_id in members:
+            await self.send_to_user(member_id, payload)
 
-manager = ConnectionManager()
+manager = SecureConnectionManager()
 
-# ----------------- HTTP REST API -----------------
-
-@app.get("/")
-def home():
-    return {"status": "Telegram Clone Engine Online", "active_users": len(active_sockets)}
-
-class AuthRequest(BaseModel):
+# ----------------- REST API МОДЕЛИ -----------------
+class RegisterRequest(BaseModel):
     username: str
+    password: str
     name: str
     phone: str
 
-@app.post("/api/auth")
-def auth_user(req: AuthRequest):
-    username_clean = req.username.strip().replace("@", "").lower()
-    # Ищем существующего пользователя
-    for uid, user in users_db.items():
-        if user["username"].lower() == username_clean:
-            return {"status": "ok", "user": user}
-    
-    # Регистрация нового аккаунта
-    new_id = f"user_{uuid.uuid4().hex[:8]}"
-    new_user = {
-        "id": new_id,
-        "username": username_clean,
-        "name": req.name.strip(),
-        "phone": req.phone.strip(),
-        "bio": "Использую Aura Messenger 🚀",
-        "avatar_color": len(req.name) % 8,
-        "online": True,
-        "last_seen": "в сети",
-    }
-    users_db[new_id] = new_user
+class LoginRequest(BaseModel):
+    username: str
+    password: str
 
-    # Автоматически создаем чат «Избранное» (Saved Messages)
-    saved_chat_id = f"saved_{new_id}"
-    chats_db[saved_chat_id] = {
-        "id": saved_chat_id,
-        "type": "saved",
-        "name": "Избранное",
-        "members": [new_id],
-        "created_by": new_id,
-        "pinned_msg_id": None
+# ----------------- ЭНДПОИНТЫ АВТОРИЗАЦИИ -----------------
+@app.post("/api/register")
+def register(req: RegisterRequest):
+    username_clean = req.username.strip().replace("@", "").lower()
+    if len(req.password) < 6:
+        raise HTTPException(status_code=400, detail="Пароль должен содержать минимум 6 символов")
+
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT id FROM users WHERE username = ?", (username_clean,))
+    if c.fetchone():
+        conn.close()
+        raise HTTPException(status_code=400, detail="Пользователь с таким юзернеймом уже существует")
+
+    user_id = f"usr_{uuid.uuid4().hex[:10]}"
+    hashed_pwd = hash_password(req.password)
+    now_str = datetime.now().isoformat()
+
+    c.execute("""
+        INSERT INTO users (id, username, password_hash, name, phone, bio, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (user_id, username_clean, hashed_pwd, req.name.strip(), req.phone.strip(), "В сети Aura 🛡", now_str))
+
+    # Создаем Избранное
+    saved_id = f"saved_{user_id}"
+    c.execute("INSERT INTO chats (id, type, name, created_by) VALUES (?, ?, ?, ?)", (saved_id, "saved", "Избранное", user_id))
+    c.execute("INSERT INTO chat_members (chat_id, user_id) VALUES (?, ?)", (saved_id, user_id))
+
+    conn.commit()
+    conn.close()
+
+    token = create_access_token(user_id)
+    return {
+        "status": "ok",
+        "token": token,
+        "user": {
+            "id": user_id,
+            "username": username_clean,
+            "name": req.name.strip(),
+            "phone": req.phone.strip(),
+            "bio": "В сети Aura 🛡"
+        }
     }
-    messages_db[saved_chat_id] = []
-    
-    return {"status": "ok", "user": new_user}
+
+@app.post("/api/login")
+def login(req: LoginRequest):
+    username_clean = req.username.strip().replace("@", "").lower()
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT id, username, password_hash, name, phone, bio FROM users WHERE username = ?", (username_clean,))
+    row = c.fetchone()
+    conn.close()
+
+    if not row or not verify_password(req.password, row[2]):
+        raise HTTPException(status_code=401, detail="Неверный юзернейм или пароль")
+
+    user_id = row[0]
+    token = create_access_token(user_id)
+    return {
+        "status": "ok",
+        "token": token,
+        "user": {
+            "id": user_id,
+            "username": row[1],
+            "name": row[3],
+            "phone": row[4],
+            "bio": row[5]
+        }
+    }
+
+@app.get("/api/chats")
+def get_chats(token: str):
+    user_id = decode_token(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Недействительный токен")
+
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("""
+        SELECT c.id, c.type, c.name, c.pinned_msg_id
+        FROM chats c
+        JOIN chat_members cm ON c.id = cm.chat_id
+        WHERE cm.user_id = ?
+    """, (user_id,))
+    chat_rows = c.fetchall()
+
+    result = []
+    for cid, ctype, cname, pinned_id in chat_rows:
+        # Получаем последнее сообщение
+        c.execute("SELECT text, time FROM messages WHERE chat_id = ? ORDER BY rowid DESC LIMIT 1", (cid,))
+        last_msg_row = c.fetchone()
+        last_text = last_msg_row[0] if last_msg_row else "Чат создан"
+        last_time = last_msg_row[1] if last_msg_row else ""
+
+        display_name = cname
+        avatar_letter = cname[0] if cname else "?"
+        is_online = False
+        status_text = ""
+
+        if ctype == "personal":
+            c.execute("SELECT u.name, u.username FROM users u JOIN chat_members cm ON u.id = cm.user_id WHERE cm.chat_id = ? AND u.id != ?", (cid, user_id))
+            partner = c.fetchone()
+            if partner:
+                display_name = partner[0]
+                avatar_letter = partner[0][0]
+                is_online = partner[1] in manager.active_sockets
+                status_text = "в сети" if is_online else "был(а) недавно"
+        elif ctype == "saved":
+            display_name = "Избранное"
+            avatar_letter = "⭐️"
+            status_text = "облако"
+        else:
+            c.execute("SELECT COUNT(*) FROM chat_members WHERE chat_id = ?", (cid,))
+            count = c.fetchone()[0]
+            status_text = f"{count} участников"
+
+        result.append({
+            "id": cid,
+            "type": ctype,
+            "name": display_name,
+            "avatar_letter": avatar_letter,
+            "last_message": last_text,
+            "time": last_time,
+            "is_online": is_online,
+            "status_text": status_text,
+            "pinned_msg_id": pinned_id
+        })
+
+    conn.close()
+    return {"chats": result}
 
 @app.get("/api/users/search")
-def search_users(query: str):
-    q = query.strip().replace("@", "").lower()
-    results = [
-        u for u in users_db.values() 
-        if q in u["username"].lower() or q in u["name"].lower() or q in u["phone"]
-    ]
-    return {"results": results}
+def search_users(query: str, token: str):
+    user_id = decode_token(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Недействительный токен")
 
-@app.get("/api/chats/{user_id}")
-def get_user_chats(user_id: str):
-    user_chats = []
-    for cid, chat in chats_db.items():
-        if user_id in chat["members"]:
-            msgs = messages_db.get(cid, [])
-            last_msg = msgs[-1] if msgs else {"text": "Чат создан", "time": "", "sender_name": ""}
-            
-            # Для личного диалога подставляем имя и статус собеседника
-            chat_title = chat["name"]
-            avatar_letter = chat_title[0] if chat_title else "?"
-            is_online = False
-            status_text = ""
-            
-            if chat["type"] == "personal":
-                other_ids = [m for m in chat["members"] if m != user_id]
-                if other_ids and other_ids[0] in users_db:
-                    partner = users_db[other_ids[0]]
-                    chat_title = partner["name"]
-                    avatar_letter = partner["name"][0]
-                    is_online = partner.get("online", False)
-                    status_text = "в сети" if is_online else f"был(а) в {partner.get('last_seen', 'недавно')}"
-            elif chat["type"] == "saved":
-                chat_title = "Избранное"
-                avatar_letter = "⭐️"
-                status_text = "сохраненные сообщения"
-            else:
-                status_text = f"{len(chat['members'])} участников"
+    q = f"%{query.strip().replace('@', '').lower()}%"
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT id, username, name, phone, bio FROM users WHERE (username LIKE ? OR name LIKE ? OR phone LIKE ?) AND id != ?", (q, q, q, user_id))
+    rows = c.fetchall()
+    conn.close()
 
-            user_chats.append({
-                "id": cid,
-                "type": chat["type"],
-                "name": chat_title,
-                "avatar_letter": avatar_letter,
-                "last_message": last_msg.get("text", ""),
-                "time": last_msg.get("time", ""),
-                "is_online": is_online,
-                "status_text": status_text,
-                "members": chat["members"],
-                "pinned_msg_id": chat.get("pinned_msg_id")
-            })
-    return {"chats": user_chats}
+    return {"results": [{"id": r[0], "username": r[1], "name": r[2], "phone": r[3], "bio": r[4]} for r in rows]}
 
-# ----------------- WEBSOCKET ENGINE -----------------
+# ----------------- ЗАЩИЩЕННЫЙ WEBSOCKET -----------------
+@app.websocket("/ws")
+async def secure_websocket(websocket: WebSocket, token: str):
+    user_id = decode_token(token)
+    if not user_id:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
 
-@app.websocket("/ws/{user_id}")
-async def websocket_endpoint(websocket: WebSocket, user_id: str):
     await manager.connect(websocket, user_id)
     try:
         while True:
             raw = await websocket.receive_text()
             data = json.loads(raw)
-            msg_type = data.get("type")
+            action = data.get("action")
 
-            if msg_type == "ping":
+            if action == "ping":
                 await websocket.send_text(json.dumps({"type": "pong"}))
                 continue
 
-            # Отправка обычного или голосового сообщения
-            elif msg_type == "send_message":
+            elif action == "send_message":
                 chat_id = data["chat_id"]
-                msg_id = f"msg_{uuid.uuid4().hex[:8]}"
+                text = data.get("text", "")
+                is_voice = 1 if data.get("is_voice") else 0
                 time_str = datetime.now().strftime("%H:%M")
-                
-                new_msg = {
-                    "id": msg_id,
-                    "chat_id": chat_id,
-                    "sender_id": user_id,
-                    "sender_name": users_db.get(user_id, {}).get("name", "Пользователь"),
-                    "text": data.get("text", ""),
-                    "time": time_str,
-                    "reactions": {}, # {"❤️": 2, "🔥": 1}
-                    "is_pinned": False,
-                    "is_voice": data.get("is_voice", False),
-                    "voice_duration": data.get("voice_duration", 0),
-                    "media_type": data.get("media_type", "none"),
-                }
-                
-                if chat_id not in messages_db:
-                    messages_db[chat_id] = []
-                messages_db[chat_id].append(new_msg)
+                msg_id = f"msg_{uuid.uuid4().hex[:10]}"
 
-                await manager.broadcast_to_chat(chat_id, {
+                # Серверная проверка: состоит ли отправитель в этом чате
+                conn = sqlite3.connect(DB_FILE)
+                c = conn.cursor()
+                c.execute("SELECT 1 FROM chat_members WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
+                if not c.fetchone():
+                    conn.close()
+                    continue
+
+                # Имя отправителя
+                c.execute("SELECT name FROM users WHERE id = ?", (user_id,))
+                sender_name = c.fetchone()[0]
+
+                c.execute("INSERT INTO messages (id, chat_id, sender_id, text, time, is_voice) VALUES (?, ?, ?, ?, ?, ?)",
+                          (msg_id, chat_id, user_id, text, time_str, is_voice))
+                conn.commit()
+                conn.close()
+
+                await manager.broadcast_chat(chat_id, {
                     "type": "new_message",
-                    "message": new_msg
+                    "message": {
+                        "id": msg_id,
+                        "chat_id": chat_id,
+                        "sender_id": user_id,
+                        "sender_name": sender_name,
+                        "text": text,
+                        "time": time_str,
+                        "is_voice": bool(is_voice),
+                        "reactions": {}
+                    }
                 })
 
-            # Статус "Печатает..." (Typing...)
-            elif msg_type == "typing":
+            elif action == "typing":
                 chat_id = data["chat_id"]
-                await manager.broadcast_to_chat(chat_id, {
+                conn = sqlite3.connect(DB_FILE)
+                c = conn.cursor()
+                c.execute("SELECT name FROM users WHERE id = ?", (user_id,))
+                user_name = c.fetchone()[0]
+                conn.close()
+
+                await manager.broadcast_chat(chat_id, {
                     "type": "user_typing",
                     "chat_id": chat_id,
                     "user_id": user_id,
-                    "user_name": users_db.get(user_id, {}).get("name", "Пользователь")
+                    "user_name": user_name
                 })
 
-            # Реакция на сообщение (🔥, ❤️, 👍, 😂, 👎)
-            elif msg_type == "add_reaction":
-                chat_id = data["chat_id"]
-                msg_id = data["msg_id"]
-                emoji = data["emoji"]
-                if chat_id in messages_db:
-                    for m in messages_db[chat_id]:
-                        if m["id"] == msg_id:
-                            m["reactions"][emoji] = m["reactions"].get(emoji, 0) + 1
-                            await manager.broadcast_to_chat(chat_id, {
-                                "type": "reaction_updated",
-                                "chat_id": chat_id,
-                                "msg_id": msg_id,
-                                "reactions": m["reactions"]
-                            })
-                            break
-
-            # Закрепление сообщения (Pin)
-            elif msg_type == "pin_message":
-                chat_id = data["chat_id"]
-                msg_id = data["msg_id"]
-                if chat_id in chats_db:
-                    chats_db[chat_id]["pinned_msg_id"] = msg_id
-                    await manager.broadcast_to_chat(chat_id, {
-                        "type": "message_pinned",
-                        "chat_id": chat_id,
-                        "msg_id": msg_id,
-                        "text": data.get("text", "")
-                    })
-
-            # Создание прямого диалога с найденным другом
-            elif msg_type == "create_chat":
+            elif action == "create_personal_chat":
                 partner_id = data["partner_id"]
                 chat_id = f"chat_{min(user_id, partner_id)}_{max(user_id, partner_id)}"
-                if chat_id not in chats_db:
-                    chats_db[chat_id] = {
-                        "id": chat_id,
-                        "type": "personal",
-                        "name": "Личный диалог",
-                        "members": [user_id, partner_id],
-                        "created_by": user_id,
-                        "pinned_msg_id": None
-                    }
-                    messages_db[chat_id] = []
-                
-                init_event = {"type": "chat_created", "chat_id": chat_id}
-                await manager.send_personal(user_id, init_event)
-                await manager.send_personal(partner_id, init_event)
+                conn = sqlite3.connect(DB_FILE)
+                c = conn.cursor()
+                c.execute("SELECT id FROM chats WHERE id = ?", (chat_id,))
+                if not c.fetchone():
+                    c.execute("INSERT INTO chats (id, type, name, created_by) VALUES (?, ?, ?, ?)", (chat_id, "personal", "Личный диалог", user_id))
+                    c.execute("INSERT INTO chat_members (chat_id, user_id) VALUES (?, ?)", (chat_id, user_id))
+                    c.execute("INSERT INTO chat_members (chat_id, user_id) VALUES (?, ?)", (chat_id, partner_id))
+                    conn.commit()
+                conn.close()
 
-            # Создание группы / канала
-            elif msg_type == "create_group_channel":
-                c_type = data["group_type"] # 'group' или 'channel'
-                c_name = data["name"]
-                new_c_id = f"{c_type}_{uuid.uuid4().hex[:6]}"
-                
-                chats_db[new_c_id] = {
-                    "id": new_c_id,
-                    "type": c_type,
-                    "name": c_name,
-                    "members": [user_id],
-                    "created_by": user_id,
-                    "pinned_msg_id": None,
-                    "invite_link": f"https://t.me/join_{new_c_id}"
-                }
-                messages_db[new_c_id] = []
-                await manager.send_personal(user_id, {"type": "chat_created", "chat_id": new_c_id})
+                init_payload = {"type": "chat_created", "chat_id": chat_id}
+                await manager.send_to_user(user_id, init_payload)
+                await manager.send_to_user(partner_id, init_payload)
+
+            elif action == "create_group":
+                name = data["name"]
+                g_type = data.get("group_type", "group")
+                chat_id = f"{g_type}_{uuid.uuid4().hex[:8]}"
+
+                conn = sqlite3.connect(DB_FILE)
+                c = conn.cursor()
+                c.execute("INSERT INTO chats (id, type, name, created_by) VALUES (?, ?, ?, ?)", (chat_id, g_type, name, user_id))
+                c.execute("INSERT INTO chat_members (chat_id, user_id) VALUES (?, ?)", (chat_id, user_id))
+                conn.commit()
+                conn.close()
+
+                await manager.send_to_user(user_id, {"type": "chat_created", "chat_id": chat_id})
 
     except WebSocketDisconnect:
         manager.disconnect(user_id)
