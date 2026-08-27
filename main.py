@@ -414,14 +414,26 @@ def get_chats(token: str):
         partner = c.fetchone()
         c.execute("SELECT text, time FROM messages WHERE chat_id = ? ORDER BY rowid DESC LIMIT 1", (chat_id,))
         last_msg = c.fetchone()
-        chat_name = partner[1] if partner else default_name
-        partner_id = partner[0] if partner else ""
-        avatar_url = partner[2] if partner else ""
+        
+        if chat_type == 'saved':
+            chat_name = "Избранное"
+            partner_id = user_id
+            avatar_url = ""
+            is_online = True
+            status_text = "Ваше персональное облако"
+        else:
+            chat_name = partner[1] if partner else default_name
+            partner_id = partner[0] if partner else ""
+            avatar_url = partner[2] if partner else ""
+            is_online = partner_id in manager.active_sockets
+            status_text = "online" if is_online else "offline"
+            
         result.append({
             "id": chat_id, "type": chat_type, "name": chat_name, "partner_id": partner_id, "avatar_url": avatar_url,
             "last_message": last_msg[0] if last_msg else "Чат создан", "time": last_msg[1] if last_msg else "",
-            "is_online": partner_id in manager.active_sockets, "status_text": "online" if partner_id in manager.active_sockets else "offline",
-            "is_archived": False
+            "is_online": is_online, "status_text": status_text,
+            "is_archived": False,
+            "is_saved": chat_type == 'saved'
         })
     conn.close()
     return {"chats": result}
@@ -462,7 +474,7 @@ def create_chat(partner_id: str, token: str, chat_type: str = "direct"):
         raise HTTPException(status_code=401)
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("SELECT cm1.chat_id FROM chat_members cm1 JOIN chat_members cm2 ON cm1.chat_id = cm2.chat_id WHERE cm1.user_id = ? AND cm2.user_id = ?", (user_id, partner_id))
+    c.execute("SELECT cm1.chat_id FROM chat_members cm1 JOIN chat_members cm2 ON cm1.chat_id = cm2.chat_id WHERE cm1.user_id = ? AND cm2.user_id = ? AND cm1.chat_id NOT IN (SELECT id FROM chats WHERE type = 'saved')", (user_id, partner_id))
     existing = c.fetchone()
     if existing:
         conn.close()
@@ -471,6 +483,31 @@ def create_chat(partner_id: str, token: str, chat_type: str = "direct"):
     c.execute("INSERT INTO chats (id, type, name, created_by) VALUES (?, ?, 'Direct Chat', ?)", (chat_id, chat_type, user_id))
     c.execute("INSERT INTO chat_members (chat_id, user_id) VALUES (?, ?)", (chat_id, user_id))
     c.execute("INSERT INTO chat_members (chat_id, user_id) VALUES (?, ?)", (chat_id, partner_id))
+    conn.commit()
+    conn.close()
+    return {"chat_id": chat_id}
+
+@app.post("/api/chats/saved")
+def get_or_create_saved_chat(token: str):
+    user_id = decode_token(token)
+    if not user_id:
+        raise HTTPException(status_code=401)
+    
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("""
+        SELECT c.id FROM chats c 
+        JOIN chat_members cm ON c.id = cm.chat_id 
+        WHERE c.type = 'saved' AND cm.user_id = ?
+    """, (user_id,))
+    row = c.fetchone()
+    if row:
+        conn.close()
+        return {"chat_id": row[0]}
+    
+    chat_id = f"saved_{uuid.uuid4().hex[:10]}"
+    c.execute("INSERT INTO chats (id, type, name, created_by) VALUES (?, 'saved', 'Избранное', ?)", (chat_id, user_id))
+    c.execute("INSERT INTO chat_members (chat_id, user_id) VALUES (?, ?)", (chat_id, user_id))
     conn.commit()
     conn.close()
     return {"chat_id": chat_id}
